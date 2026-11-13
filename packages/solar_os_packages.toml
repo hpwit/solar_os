@@ -547,6 +547,11 @@ label = "Lua"
 category = "Scripting"
 members = ["app_lua", "service_emotion", "service_jet", "service_robot"]
 
+[groups.asm]
+label = "ESPLiveScript compiler (asm)"
+category = "Scripting"
+members = ["app_asm"]
+
 [groups.playground]
 label = "Playground package manager"
 category = "Scripting"
@@ -3097,6 +3102,15 @@ label = "app.lua"
 depends = ["service_script_net", "service_script_runner", "service_script_media"]
 sources = ["apps/solar_os_lua.c"]
 requires = ["lua"]
+capabilities = ["psram"]
+
+[packages.app_asm]
+label = "app.asm"
+# ESPLiveScript emits Xtensa machine code.
+targets = ["esp32", "esp32s3"]
+sources = ["apps/solar_os_asm_app.c", "services/solar_os_asm_runtime.cpp"]
+# components/asmparser2: ESPLiveScript 2 (hpwit/new-parser).
+requires = ["asmparser2", "esp_timer"]
 capabilities = ["psram"]
 
 [packages.app_playground]

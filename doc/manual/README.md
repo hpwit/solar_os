@@ -146,6 +146,7 @@ This is the canonical documentation used by GitHub, the generated solar-os.eu we
 - [Apple II Plus application](app.apple2.md) — Run Apple II Plus software with the external foreground module
 - [Application reference](apps.md) — Usage, controls, and examples for every foreground application
 - [arecord application](apps.md#arecord) — Record a registered capture endpoint to a WAV file. The default is the first compatible input; -i selects a specific stream such as adc0.capture. This requires a registered input device, but not built-in board audio. With -d, recording stops after the specified number of seconds. Without -d, recording continues until app-exit, the storage fills, or the WAV size limit is reached. It can be launched from display, UART, USB CDC, Telnet, and other port shells.
+- [asm application](apps.md#asm) — ESPLiveScript 2 compiler. It compiles a small C-like language to Xtensa machine code on the device, runs it on its own task with parameters from the command line, and saves the compiled binary so it can be run later without its source. See ESPLiveScript for parameters, printing and the script bindings.
 - [calc application](apps.md#calc) — Scientific calculator and function plotter. On a graphical display, calc opens an expression list beside a Cartesian plot. From UART, USB CDC, Telnet, or any other text-only shell, the same command opens a scientific REPL without the plot pane. calc --tui forces that REPL even when graphics are available.
 - [chat application](apps.md#chat) — Tabbed provider-neutral conversation client. The Channels tab groups conversations by named instance, including IRC, Gateway, MeshCore, and Link. Enter selects a conversation and opens its bounded shared history on the Chat tab, which also contains the message/command input. The app opens and remains useful offline; network or radio transport jobs connect independently.
 - [clock application](apps.md#clock) — Full-screen graphical seven-segment clock, alarm countdown, and stopwatch. The countdown is serviced in the background, so it continues when the Clock session is suspended. It works without RTC hardware while SolarOS remains powered. With a wired RTC interrupt, the RTC alarm or countdown is also armed and explicit light sleep can wake for it.
@@ -270,6 +271,7 @@ This is the canonical documentation used by GitHub, the generated solar-os.eu we
 - [Computer vision](vision.md) — Native QR decoding, statistics, segmentation, filtering, morphology, image difference, and blobs
 - [Digital signal processing](dsp.md) — Portable fixed-point DSP operations, streaming contexts, and script APIs
 - [Emotion engine](emotion.md) — Animated facial expressions and optional reaction sounds for Python and Lua
+- [ESPLiveScript compiler](livescript.md) — Compile, run and save ESPLiveScript 2 programs with the asm command
 - [Jet 3D renderer](jet.md) — Script-defined 3D scenes using the resident Jet library
 - [Lua API overview](lua.md) — Runtime basics, conventions, and service API topic index
 - [Lua audio and control API](lua.audio.md) — Audio and control: audio, synth, dsp, controls, parameters, midi, osc

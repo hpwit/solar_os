@@ -1,0 +1,382 @@
+#pragma once
+#ifndef __SCRIPT_EXECUTABLE__
+#define __SCRIPT_EXECUTABLE__
+// A v1-style convenience layer for sketches that don't need the
+// individual parse -> createBinary -> createExecutableFromBinary steps
+// spelled out (see any examples/*.ino file for what those look like) --
+// matches the ergonomics of upstream ESPLiveScript's
+// Parser::parseScript()/Executable::isExeExists()/Executable::execute():
+//
+//   ScriptExecutable exec = parseScript(script);
+//   if (exec.isExeExists())
+//   {
+//      exec.execute("main");
+//   }
+//   // no explicit cleanup needed -- ~ScriptExecutable() frees the
+//   // loaded executable automatically when exec goes out of scope.
+#include "asm_execute.h"
+#include "arguments.h"
+
+#if defined(ESP32) || defined(ARDUINO_ARCH_ESP32)
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#endif
+
+// What the task started by ScriptExecutable::executeAsTask() is doing
+// (ScriptExecutable::state()). Only that task is tracked: a plain
+// execute() runs on the caller's own task and leaves this alone.
+enum class ScriptState : uint8_t
+{
+    notStarted, // executeAsTask() was never called
+    running,
+    paused,     // pause(): stopped where it was, restart() continues it
+    stopped,    // kill(), or the function returned on its own
+};
+
+// Owns a compiled+loaded script; ~ScriptExecutable() frees it via
+// freeExecutable() automatically.
+//
+// Deliberately NOT copyable *or* movable, unlike a typical modern C++
+// RAII type -- and that's a real constraint, not stylistic caution:
+// `executable` (asm_types.h) holds vect<globalcall>/vect<jsonVariable>
+// members, and vect<T> (vect.h) has a destructor (frees its backing
+// array) but no matching copy/move constructor or assignment operator --
+// a Rule-of-Three gap that predates this file. Assigning or copy/move-
+// constructing an `executable` (or anything containing one) invokes the
+// compiler-generated *shallow* member-wise copy, so two objects end up
+// sharing the same vect<T> backing-array pointer; whichever is destroyed
+// first frees it out from under the other (confirmed via
+// AddressSanitizer: a heap-use-after-free in isWrapperRecord(), from an
+// earlier version of this class that tried to hand-roll safe move
+// semantics by assigning `exe = other.exe`). The only thing that's
+// actually safe with these types is direct-initializing a fresh variable
+// from a prvalue function-call expression, e.g. `executable exe =
+// createExecutableFromBinary(&bin);` (every example does this) or
+// `return ScriptExecutable(&bin);` (parseScript() does this) --
+// C++17 guarantees that construction is elided, never actually invoking
+// copy/move at all. Deleting copy *and* move here makes any attempt to
+// do something else (store one in a container, return a named local
+// instead of a fresh prvalue, etc.) a compile error instead of a latent
+// crash. If you need to hold several compiled scripts at once, store
+// each behind its own separate ScriptExecutable-holding scope/variable
+// (each gets its own parseScript() call) rather than trying to move one
+// around.
+class ScriptExecutable
+{
+public:
+    ScriptExecutable() {}
+    // Constructs by calling createExecutableFromBinary(bin) directly in
+    // the member-initializer list (so `exe` is elision-constructed from
+    // that call's prvalue, per the class comment above), then frees
+    // bin's own buffers (binary_data/function_data -- see freeBinary(),
+    // asm_serialize.h) since createExecutableFromBinary() only ever
+    // copies out of them, and reports a loader error if there was one --
+    // this has to happen here, after `exe` exists, rather than in
+    // parseScript() itself, precisely because getting `exe`'s value out
+    // to check it would require the same unsafe copy/assignment this
+    // class exists to avoid.
+    explicit ScriptExecutable(Binary *bin);
+    // Kills the script's task first, if executeAsTask() started one.
+    ~ScriptExecutable();
+
+    ScriptExecutable(const ScriptExecutable &) = delete;
+    ScriptExecutable &operator=(const ScriptExecutable &) = delete;
+    ScriptExecutable(ScriptExecutable &&) = delete;
+    ScriptExecutable &operator=(ScriptExecutable &&) = delete;
+
+    // Matches v1's Executable::free() -- releases the compiled script's
+    // memory right now instead of waiting for `this` to go out of scope.
+    // Useful when compiling several scripts one after another and only
+    // one needs to be live at a time (see examples/TwoScripts): calling
+    // free() between them keeps peak memory down instead of letting both
+    // stay resident until whatever scope holds them both finally exits.
+    // Safe to call more than once (freeExecutable() is itself
+    // idempotent -- it NULLs/empties everything it frees) and safe to
+    // let the destructor run afterward, which is exactly what happens
+    // when `this` then goes out of scope normally. After this,
+    // isExeExists() is false and no execute()/executeOnly() call will
+    // find anything to run.
+    void free();
+
+    // True if the last execute()/executeOnly() was cut short by a
+    // safe_mode bounds check (that call returned false); runtimeError()
+    // then says which array, its size and the offending index. See
+    // runtime_functions.h.
+    bool hasRuntimeError() const { return exe.runtimeError.error; }
+    const runtime_error_struct &runtimeError() const { return exe.runtimeError; }
+
+    // Matches upstream's Executable::isExeExists() -- true if parsing,
+    // assembling, and loading all succeeded and there's at least one
+    // callable function. Not const-qualified: vect<T>::size() (vect.h)
+    // isn't const either, matching this codebase's style throughout.
+    bool isExeExists();
+
+    // Calls a declared function by name (main() included -- see
+    // callFunction()'s own doc comment on why that works even for it)
+    // via callFunction(), so `result` (if non-NULL) receives a real
+    // return value -- unlike runExecutable()/runExecutableWithArgs(),
+    // which only exist for main() and never surface one. Three
+    // overloads mirroring callFunction()'s own: no arguments, a typed
+    // Arguments list, or a raw int32_t[].
+    //
+    // Matches upstream ESPLiveScript's own execute.h: `@__footer` --
+    // wherever createBinary() put any top-level (outside-any-function)
+    // work a script's global scope needs done before anything else runs,
+    // most commonly a global struct array's element constructors (e.g.
+    // BouncingBalls.ino's `ball Balls[max_nb_balls];`) -- is called
+    // *first*, every single time execute() is called, before `name`
+    // itself. If the script has no such top-level work, `footer` was
+    // never declared and this is a harmless no-op (callFunction() simply
+    // doesn't find it and returns false, silently, same as upstream --
+    // its own execute() discards this exact call's result too). Without
+    // this, a script whose global struct instances rely on their
+    // constructor having run (real state, not whatever the loader's
+    // malloc'd data region happens to contain) would silently see
+    // uninitialized fields the first time any function touches them.
+    bool execute(const char *name, int32_t *result = NULL);
+    bool execute(const char *name, Arguments *args, int32_t *result = NULL);
+    bool execute(const char *name, const int32_t *args, int nargs, int32_t *result = NULL);
+
+    // Same as execute(), minus the `footer` call -- matches upstream's
+    // own executeOnly(), which exists there for exactly the cases
+    // execute() itself doesn't fit: re-entering a script repeatedly
+    // (e.g. KeyboardCallback.ino's pattern, once per keypress) without
+    // re-running top-level initialization -- global struct constructors
+    // included -- on every single call, which would otherwise silently
+    // reset any state a prior call had already mutated.
+    bool executeOnly(const char *name, int32_t *result = NULL);
+    bool executeOnly(const char *name, Arguments *args, int32_t *result = NULL);
+    bool executeOnly(const char *name, const int32_t *args, int nargs, int32_t *result = NULL);
+
+    // v1's execute(name, json): the script's `json path as type name;`
+    // variables take their values from the JSON document, after the
+    // initialization (so a JSON value wins over the variable's initial
+    // value) and before the function runs. A key the document lacks
+    // leaves its variable as it was. Needs <ArduinoJson.h> included in
+    // the sketch; false if the JSON can't be read (the reason printed).
+    bool execute(const char *name, const char *json, int32_t *result = NULL);
+    bool executeOnly(const char *name, const char *json, int32_t *result = NULL);
+    // Only fills the variables, without running anything (v1's
+    // updateParam()): for a script running as a task, say.
+    bool updateJson(const char *json);
+
+#if defined(ESP32) || defined(ARDUINO_ARCH_ESP32)
+    // Runs execute(name) (footer included) on its own FreeRTOS task
+    // instead of blocking the caller -- e.g. so setup() can hand a
+    // script's own main() loop its own task while Arduino's loop()
+    // keeps running. A deliberately minimal port of upstream
+    // ESPLiveScript's much larger executeAsTask() family (execute.h):
+    // that version also maintains a registry of up to _MAX_PROG_AT_ONCE
+    // concurrently-running scripts, suspend()/restart()/kill() with
+    // cross-task handshaking, and sync()/_syncExt inter-task
+    // coordination. Of those, v2 has the per-script part: pause(),
+    // restart() and kill() below, and state(); there is no registry of
+    // scripts and no sync(). Calling it while this script's task is
+    // still running or paused kills that task first, as v1 does. Only
+    // declared/defined when
+    // actually building for ESP32 (FreeRTOS's task API doesn't exist
+    // otherwise, including this repo's own host test build) -- guard
+    // any call site the same way if it needs to compile for both.
+    //
+    // `name` must stay valid for as long as the task runs (a string
+    // literal, same as every execute()/executeOnly() call site already
+    // assumes) -- unlike those, this doesn't call back into `name`
+    // until the task actually gets scheduled, not before returning.
+    // `this` must outlive the task too, same "make it `static`" caveat
+    // KeyboardCallback.ino's own header comment already documents for
+    // holding a ScriptExecutable alive past setup().
+    //
+    // `core` picks which CPU the task is pinned to (0 or 1 on a real
+    // dual-core ESP32; ESP32-S2/C3 etc. only have core 0, and
+    // xTaskCreatePinnedToCore() handles that transparently) --
+    // xTaskCreatePinnedToCore()'s own tskNO_AFFINITY (the default here)
+    // leaves it to the scheduler instead of pinning at all, matching
+    // plain xTaskCreate()'s behavior. Arduino's own setup()/loop() run
+    // pinned to core 1 by default (WiFi/BT's stack owns core 0) -- pass
+    // 0 explicitly for a script task that shouldn't compete with
+    // loop() for the same core, matching v1's own default
+    // (`__RUN_CORE`, always 0) if you want that instead of this
+    // default's no-affinity behavior.
+    //
+    // `taskName` names the FreeRTOS task (what task lists and statistics
+    // show); NULL uses `name`. Same lifetime rule as `name`.
+    bool executeAsTask(const char *name, uint32_t stackSize = 8192, UBaseType_t priority = 1,
+                        BaseType_t core = tskNO_AFFINITY, const char *taskName = NULL);
+
+    // Same, passing parameters to `name`, as execute(name, args) does:
+    //   Arguments args;
+    //   args.add(40);                       // int main(int n, float speed)
+    //   args.add(1.5f);
+    //   exec.executeAsTask("main", &args);
+    // Parameters are int (any 32-bit integer type in the script: int,
+    // uint32_t, uint8_t, bool...) or float, 6 at most (they travel in the
+    // registers a10..a15; more are dropped). A string, structure or array
+    // goes by address: args.add((int)(uintptr_t)text) for a char *
+    // parameter; what it points to must stay valid while the task uses it. They are copied before this
+    // returns, so `args` can be a local variable. A function with fewer
+    // parameters ignores the extra values; one with more sees garbage in
+    // the missing ones. See "Parameters for a task" in the README.
+    bool executeAsTask(const char *name, Arguments *args, uint32_t stackSize = 8192,
+                       UBaseType_t priority = 1, BaseType_t core = tskNO_AFFINITY,
+                       const char *taskName = NULL);
+    // The raw form, as execute(name, args, nargs): ints as they are, floats
+    // as their bit pattern (memcpy a float into an int32_t).
+    bool executeAsTask(const char *name, const int32_t *args, int nargs, uint32_t stackSize = 8192,
+                       UBaseType_t priority = 1, BaseType_t core = tskNO_AFFINITY,
+                       const char *taskName = NULL);
+
+    // Control of the task executeAsTask() started -- v1's suspend(),
+    // restart() and kill(). Each returns false, doing nothing, when the
+    // task is not in a state it applies to.
+    //
+    // pause(): running -> paused. The task stops where it is
+    //   (vTaskSuspend()); nothing else about it changes.
+    // restart(): paused -> running, carrying on from where it stopped
+    //   (vTaskResume()). Not a fresh start: call executeAsTask() again
+    //   for that.
+    // kill(): running or paused -> stopped (vTaskDelete()). Also frees a
+    //   task whose function has already returned (state() stopped), whose
+    //   stack is otherwise kept until then -- see executeAsTask().
+    //
+    // The task is stopped wherever it happens to be, possibly inside a
+    // host function the script called. Pausing it there holds whatever
+    // that function holds (Serial, printf's lock, a mutex of yours...)
+    // until restart(); killing it there never releases it. If that
+    // matters, have the script's loop call a host function that checks
+    // a flag and returns or blocks at a point you choose instead.
+    //
+    // Call them from a task (not an interrupt), and from one controlling
+    // task at a time; the script's own task may call them on itself.
+    bool pause();
+    bool restart();
+    bool kill();
+
+    // The FreeRTOS task executeAsTask() started (NULL if none) -- for
+    // reading its statistics (vTaskGetInfo(), see script_scheduler.h).
+    // Control it through pause()/restart()/kill(), not directly.
+    TaskHandle_t task() const { return taskHandle; }
+#endif
+
+    // Always notStarted where executeAsTask() does not exist.
+    ScriptState state() const { return taskState; }
+    bool isRunning() const { return taskState == ScriptState::running; }
+    bool isPaused() const { return taskState == ScriptState::paused; }
+
+    executable exe;
+
+private:
+    volatile ScriptState taskState = ScriptState::notStarted;
+#if defined(ESP32) || defined(ARDUINO_ARCH_ESP32)
+    // The task executeAsTask() started, until kill() (or the next
+    // executeAsTask(), or the destructor) deletes it. Kept after the
+    // function returns: the task then marks itself stopped and suspends
+    // itself rather than deleting itself, so that no pause()/kill() can
+    // be acting on a task that has just disappeared.
+    TaskHandle_t taskHandle = NULL;
+    portMUX_TYPE taskLock = portMUX_INITIALIZER_UNLOCKED;
+    static void taskMain(void *param);
+#endif
+};
+
+// Parses, assembles, and loads `script` in one call -- the v2 equivalent
+// of upstream's Parser::parseScript(). On any failure (parse, assemble,
+// or load error), the returned ScriptExecutable's isExeExists() is
+// false; the specific error is also printed (via display_error() for a
+// parse error, or a plain printf for an assembler/loader error), the
+// same way every hand-written example already reports it. Frees every
+// intermediate buffer this pipeline allocates that isn't part of the
+// final loaded executable -- the strdup'd copy of `script` the tokenizer
+// needs to own, and (via ScriptExecutable's constructor) Binary's
+// binary_data/function_data, a real if small one-time-per-compile leak
+// in every plain compile-from-source example in this repo (freeBinary()
+// is already used by LoadScriptBinary.ino/test_parser.cpp's save/load
+// path, but nowhere else). Only the returned ScriptExecutable's own
+// executable survives, freed automatically when it's destroyed.
+ScriptExecutable parseScript(const char *script);
+
+// What went wrong in the last parseScript()/parseScriptToBinary(), for a
+// sketch that wants to show a compile error its own way (on a display, a
+// web page...) rather than only in the console, where parseScript() has
+// already printed it:
+//
+//   ScriptExecutable exec = parseScript(script);
+//   if (!exec.isExeExists())
+//   {
+//      const CompileError &e = lastCompileError();
+//      printf("line %d: %s\n", e.line, e.message);
+//   }
+//
+// `failed` is false after a compile that worked. For a syntax error,
+// `line` and `position` (both from 1) say where it was noticed -- for a
+// missing `;`, the start of the next statement -- and `sourceLine` is that
+// line of the script. An assembler error has no line (`line` is 0).
+struct CompileError
+{
+   bool failed;
+   int line;
+   int position;
+   char message[240];
+   char sourceLine[120];
+};
+const CompileError &lastCompileError();
+
+// Prints the last compile error (see lastCompileError()) as a report:
+//
+//   error   : Expecting ;
+//   line 5  :    a = a + 1;
+//                ^
+//
+// Nothing if the last compile worked. For a sketch that only needs the
+// report in the console:
+//
+//   ScriptExecutable exec = parseScript(script);
+//   if (exec.isExeExists())
+//      exec.execute("main");
+//   else
+//      showCompileError();
+void showCompileError();
+
+// Parses, assembles, and serializes `script` in one call, without
+// loading or running it -- the one-call equivalent of upstream v1's
+// Parser::parseScriptBinary() combined with serializeBinary(), for the
+// "compile now, save the bytes, run them later (possibly from a
+// completely different sketch)" case -- see "Saving and loading
+// compiled scripts" in README.md. Shares its whole compile pipeline
+// with parseScript() (same kPrelude, same error handling/reporting),
+// it just serializes the result instead of loading it.
+//
+// - `script` -- same meaning as parseScript()'s: a plain C string, only
+//   needs to stay valid for the duration of this call.
+// - `size` -- if non-NULL, receives the returned buffer's length in
+//   bytes (needed to actually write it anywhere, e.g. to a file). Set
+//   to 0 on failure.
+// - Returns a malloc'd buffer the caller owns (free() it when done, or
+//   hand it off -- e.g. written to LittleFS/SD, see
+//   examples/SaveScriptBinary), or NULL on any failure (parse or
+//   assembler error -- already printed the same way parseScript()'s
+//   own errors are).
+uint8_t *parseScriptToBinary(const char *script, uint32_t *size);
+
+// The load-time counterpart to parseScriptToBinary() -- the one-call
+// version of deserializeBinary() + createExecutableFromBinary() +
+// freeBinary(), for a sketch that loaded a previously-saved binary blob
+// (e.g. from LittleFS/SD, see "Saving and loading compiled scripts" in
+// README.md) and just wants a real, callable script back. Register
+// bindVariable()/bindFunction() for every `external` name the saved
+// script uses *before* calling this -- exactly as createExecutableFromBinary()
+// itself requires, since that's what actually resolves them.
+//
+// - `buf`, `size` -- the serialized bytes and their length, exactly as
+//   parseScriptToBinary()/serializeBinary() produced them (or
+//   deserializeBinary()'s own doc comment's format, if you built them
+//   another way). Only read during this call; not retained.
+// - Returns a ScriptExecutable, same as parseScript() -- check
+//   isExeExists() before using it (a bad/corrupt buffer or a missing
+//   external binding surfaces here, with the specific problem already
+//   printed the same way parseScript()'s own errors are). No explicit
+//   cleanup needed (see ScriptExecutable's own class comment); call
+//   execute()/executeOnly() the same way you would on a freshly
+//   parseScript()'d one (see examples/LoadScriptBinary).
+ScriptExecutable createExecutableFromBuffer(const uint8_t *buf, uint32_t size);
+
+#endif

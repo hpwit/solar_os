@@ -81,6 +81,9 @@
 #if SOLAR_OS_PACKAGE_APP_CALC
 #include "solar_os_calc.h"
 #endif
+#if SOLAR_OS_PACKAGE_APP_ASM
+#include "solar_os_asm_app.h"
+#endif
 #if SOLAR_OS_PACKAGE_APP_COM
 #include "solar_os_com.h"
 #endif
@@ -305,6 +308,9 @@ static const solar_os_app_registry_entry_t registered_apps[] = {
 #endif
 #if SOLAR_OS_PACKAGE_APP_PYTHON
     APP_FILE_ENTRY("python", "MicroPython runtime", &solar_os_python_app, SOLAR_OS_APP_CAP_TEXT | SOLAR_OS_APP_CAP_GRAPHICS | SOLAR_OS_APP_CAP_DISPLAY | SOLAR_OS_APP_CAP_PORT, "python [script.py [args...]]", 1, 0, ".py .pyw .mpy"),
+#endif
+#if SOLAR_OS_PACKAGE_APP_ASM
+    APP_ENTRY("asm", "ESPLiveScript compiler: compile, run and save binaries", &solar_os_asm_app, SOLAR_OS_APP_CAP_TEXT | SOLAR_OS_APP_CAP_GRAPHICS | SOLAR_OS_APP_CAP_DISPLAY | SOLAR_OS_APP_CAP_PORT, "asm run|compile|save <file.sc|file.bin> [...]", 1, 0),
 #endif
 #if SOLAR_OS_PACKAGE_APP_LUA
     APP_FILE_ENTRY("lua", "Lua runtime", &solar_os_lua_app, SOLAR_OS_APP_CAP_TEXT | SOLAR_OS_APP_CAP_GRAPHICS | SOLAR_OS_APP_CAP_DISPLAY | SOLAR_OS_APP_CAP_PORT, "lua [script.lua [args...]]", 1, 0, ".lua"),

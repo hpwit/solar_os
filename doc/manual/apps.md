@@ -847,6 +847,34 @@ Controls:
 
 - App-exit key exits.
 
+## asm
+
+ESPLiveScript 2 compiler. It compiles a small C-like language to Xtensa
+machine code on the device, runs it on its own task with parameters from the
+command line, and saves the compiled binary so it can be run later without
+its source. See [ESPLiveScript](livescript.md) for parameters, printing and
+the script bindings.
+
+Usage:
+
+```text
+asm run [-f function] <file.sc|file.bin> [params...]
+asm compile <file.sc> [-o <file.bin>]
+asm save <file.sc> [<file.bin>]
+```
+
+Up to 6 parameters: whole numbers become ints, other numbers floats, the rest
+strings; they go to the function (`main` by default) and to `argc`,
+`arg(i)`, `argf(i)`, `argstr(i)`. Relative paths follow the shell's current
+directory. `asm` runs in the shell's terminal, so its messages and what a
+text script prints stay there.
+
+Controls:
+
+- App-exit key or Ctrl-C stops a running script.
+- Other keys go to the script (`readKey()`, `keyChar`, `keyCode`, and its
+  `keyboard()` function after `setup_keyboard(_handle_)`).
+
 ## curl
 
 HTTP client for quick text downloads and diagnostics. It can print response

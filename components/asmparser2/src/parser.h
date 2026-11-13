@@ -1,0 +1,66 @@
+#pragma once
+#ifndef __PARSER__
+#define __PARSER__
+#include "parser_define.h"
+#include "nodetoken.h"
+#include "compiler_error.h"
+#include "binding.h"
+
+
+#define RETURN_ERROR(x) { Error.error=x;Error.token=current();return;}
+#define RETURN_IF_ERROR if(Error.error!=noError) return;
+class Parser
+{
+public:
+    NodeToken root;
+    Parser();
+
+    int size();
+    Token *getTokenAtPos(int pos);
+    Token *current();
+    Token *next();
+    Token *prev();
+    Token *peek(int index);
+    bool Match(tokenType tt);
+    bool Match(tokenType tt, int index);
+    void parse(Script *main_script, Tokens *__tks);
+    void parseProgram();
+    void parseType();
+    void parseVariableForCreation();
+    void parseFactor();
+    void parseFunctionCall();
+    void parseDefFunction();
+    void parseExpr();
+    void parseExprConditionnal();
+    void parseExprAndOr();
+    void parseTerm();
+    void parseBlockStatement();
+    void parseUnbracedBody();
+    void parseCreateArguments();
+    void parseStatement();
+    void getVariable(bool isStore);
+    void lowerPointerMember(NodeToken *nd);
+    char *argumentTypeName(NodeToken *arg);
+    void parseComparaison();
+    void parseArguments();
+    void clean();
+    Tokens *_tks;
+};
+
+char * findForWhile(bool forBreak = false);
+NodeToken createNodeLocalVariableForCreation(NodeToken var, NodeToken nd);
+void createNodeVariable(Token *_var, bool isStore);
+varTypeEnum finduint32_t(NodeToken *nd);
+varTypeEnum findfloat(NodeToken *nd);
+extern NodeToken program, extra_parser;
+// Called with a phase name between the stages of Parser::parse() when set
+// (NULL by default): lets a caller watch memory use while compiling.
+extern void (*parserPhaseHook)(const char *phase);
+extern NodeToken main_context,ext_function_cntx,*sav_current_cntx;
+extern NodeToken functions;
+extern bool isExtra;
+
+extern bool safeMode;
+extern Stack<uint16_t> targetList;
+extern error_message_struct Error;
+#endif

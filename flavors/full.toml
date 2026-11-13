@@ -108,6 +108,7 @@ sketch = true
 invaders = true
 python = true
 lua = true
+asm = true
 playground = true
 rfm69 = true
 rfm95 = true

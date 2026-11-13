@@ -320,6 +320,12 @@
         "malloc": 1
       },
       "reason": "Module port macro/shim delegates to the host memory service; guest pointers stay fixed."
+    },
+    "src/services/solar_os_asm_runtime.cpp": {
+      "calls": {
+        "new": 2
+      },
+      "reason": "One compiled-script holder per run: asmparser2's ScriptExecutable is neither copyable nor movable, so it is constructed in place from the compiler's prvalue and deleted when the run ends."
     }
   }
 }
