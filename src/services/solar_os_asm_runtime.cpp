@@ -384,10 +384,10 @@ static void host_tprintln(const char *format, ...)
 extern "C" bool solar_os_asm_uses_screen(const uint8_t *data, size_t size)
 {
     /* Whole-word names of the screen bindings (in source text, or in a saved
-     * binary's relocation names). */
+     * binary's relocation names: "@_ext_led16", "@_show16(...)"). */
     static const char *const names[] = {
-        "led16", "show16", "show", "setPixelsize", "printscreen", "triangle",
-        "pixel", "scroll", "clear", "zoom", "stride",
+        "enableGraphicMode", "led16", "show16", "show", "setPixelsize",
+        "printscreen", "triangle", "pixel", "scroll", "clear", "zoom", "stride",
     };
     if (data == NULL) {
         return false;
@@ -398,7 +398,14 @@ extern "C" bool solar_os_asm_uses_screen(const uint8_t *data, size_t size)
             if (data[i] != (uint8_t)names[n][0] || memcmp(data + i, names[n], len) != 0) {
                 continue;
             }
-            const bool before = i > 0 && (isalnum(data[i - 1]) || data[i - 1] == '_');
+            bool before = i > 0 && (isalnum(data[i - 1]) || data[i - 1] == '_');
+            /* A saved binary prefixes the names: "@_ext_" (variables) and
+             * "@_" (functions). */
+            if (before && i >= 6 && memcmp(data + i - 6, "@_ext_", 6) == 0) {
+                before = false;
+            } else if (before && i >= 2 && memcmp(data + i - 2, "@_", 2) == 0) {
+                before = false;
+            }
             const bool after = i + len < size && (isalnum(data[i + len]) || data[i + len] == '_');
             if (!before && !after) {
                 return true;
@@ -409,6 +416,15 @@ extern "C" bool solar_os_asm_uses_screen(const uint8_t *data, size_t size)
 }
 
 /* ------------------------------------------------------------ output */
+
+/* enableGraphicMode(): on a board with a frame-buffer panel the script takes
+ * the whole screen (see solar_os_asm_screen_begin()). This build has none, so
+ * it does nothing: scripts that call it still compile and run, printing into
+ * the terminal. */
+static void host_enable_graphic_mode(void)
+{
+    (void)solar_os_asm_screen_begin();
+}
 
 static void text_emit(const char *text)
 {
@@ -467,6 +483,7 @@ extern "C" void solar_os_asm_runtime_init(void)
     BIND_F("void", "println", "char*,Args", host_printfln);
     BIND_F("void", "tprintf", "char*,Args", host_tprintf);
     BIND_F("void", "tprintln", "char*,Args", host_tprintln);
+    BIND_F("void", "enableGraphicMode", NULL, host_enable_graphic_mode);
 
     BIND_V("int", "argc", &s_argc);
     BIND_F("int", "arg", "int", host_arg);

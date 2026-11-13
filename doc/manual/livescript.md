@@ -106,6 +106,17 @@ int main(int n)
 }
 ```
 
+## Graphic mode
+
+A graphic script says so with `enableGraphicMode()`, first thing in `main()`.
+On a board whose display driver gives scripts the frame buffer, the script
+then owns the whole screen and the terminal stops drawing until it ends, so
+the two never fight over the screen (flicker). The name is also looked for
+in the source and in a saved binary (`@_ext_NAME` / `@_NAME(...)` entries),
+so the script gets the screen before it starts. This build has no such
+driver: `enableGraphicMode()` does nothing, and the script prints into the
+terminal.
+
 ## Saved binaries
 
 A saved binary holds the machine code and the names of the host bindings it
@@ -127,6 +138,7 @@ Every script can use, without declaring them:
 | `readKey()` | next key, 0 when none: arrows give `z` `q` `s` `d`, Escape 27, a released arrow its letter + 128 |
 | `keyChar`, `keyCode`, `key` | last key: character and USB HID usage |
 | `setup_keyboard(_handle_)` | the script's `keyboard()` then runs on every key press |
+| `enableGraphicMode()` | graphic mode (below) |
 | `argc`, `arg(i)`, `argf(i)`, `argstr(i)` | the command-line parameters (above) |
 | `tprintf`, `tprintln`, `printf`, `printfln`, `println` | text (above) |
 

@@ -256,9 +256,9 @@ static bool worker_run(void)
     }
     const bool stopped = S.stop_requested && !solar_os_asm_finished(program);
     solar_os_asm_stop(program);
-    if (screen) {
-        solar_os_asm_screen_end();
-    }
+    /* Also when the script took the screen itself (enableGraphicMode()). */
+    (void)screen;
+    solar_os_asm_screen_end();
     char runtime[96];
     bool ok = err == ESP_OK;
     if (solar_os_asm_runtime_error(program, runtime, sizeof(runtime))) {
