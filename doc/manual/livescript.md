@@ -37,8 +37,9 @@ asm save demo.sc [d.bin]         compile and save (default: demo.bin)
 - The app-exit key (Ctrl-]) or Ctrl-C stops a running script; Escape and the
   other keys go to the script.
 - Compile errors show the line, the source line and a marker under the place
-  the error was noticed. Loader errors (no executable memory, a missing
-  binding) are detailed on the serial console.
+  the error was noticed. A binary that cannot be loaded says why, naming
+  every binding it needs that this firmware lacks:
+  `asm: game.bin: missing binding: display, updateDisplay()`.
 
 ## Parameters
 
@@ -113,7 +114,8 @@ On a board whose display driver gives scripts the frame buffer, the script
 then owns the whole screen and the terminal stops drawing until it ends, so
 the two never fight over the screen (flicker). The name is also looked for
 in the source and in a saved binary (`@_ext_NAME` / `@_NAME(...)` entries),
-so the script gets the screen before it starts. This build has no such
+as are the frame-buffer bindings' names (`display`, `updateDisplay`,
+`setPixelsize`...), so the script gets the screen before it starts. This build has no such
 driver: `enableGraphicMode()` does nothing, and the script prints into the
 terminal.
 
@@ -121,7 +123,8 @@ terminal.
 
 A saved binary holds the machine code and the names of the host bindings it
 uses, not their addresses: `asm run file.bin` resolves them against this
-firmware. A binary that uses a binding the running firmware lacks is refused.
+firmware. A binary that uses a binding the running firmware lacks is refused,
+and the message lists every missing name (`missing binding: name, function()`).
 Parameters work the same as for a source file.
 
 ## Bindings

@@ -105,7 +105,7 @@ static script_crgb host_hsv(int h, int s, int v)
     return hsv_rainbow((uint8_t)h, (uint8_t)s, (uint8_t)v);
 }
 
-/* RGB565, byte-swapped like the frame buffer (led16). */
+/* RGB565, byte-swapped like a frame buffer (display). */
 static uint16_t host_hsv2(int h, int s, int v)
 {
     const script_crgb c = hsv_rainbow((uint8_t)h, (uint8_t)s, (uint8_t)v);
@@ -384,9 +384,9 @@ static void host_tprintln(const char *format, ...)
 extern "C" bool solar_os_asm_uses_screen(const uint8_t *data, size_t size)
 {
     /* Whole-word names of the screen bindings (in source text, or in a saved
-     * binary's relocation names: "@_ext_led16", "@_show16(...)"). */
+     * binary's relocation names: "@_ext_display", "@_updateDisplay(...)"). */
     static const char *const names[] = {
-        "enableGraphicMode", "led16", "show16", "show", "setPixelsize",
+        "enableGraphicMode", "display", "updateDisplay", "setPixelsize",
         "printscreen", "triangle", "pixel", "scroll", "clear", "zoom", "stride",
     };
     if (data == NULL) {
@@ -575,9 +575,11 @@ extern "C" esp_err_t solar_os_asm_load_binary(const uint8_t *data, uint32_t size
         if (error != NULL) {
             memset(error, 0, sizeof(*error));
             error->failed = true;
-            strlcpy(error->message,
-                    "load failed: invalid binary, missing binding or no executable "
-                    "memory (details on the serial console)",
+            /* asmparser2 says why: "missing binding: name, function()" (every
+             * name this firmware does not bind), "not a valid binary: ...",
+             * or no executable memory. */
+            const char *why = lastLoadError();
+            strlcpy(error->message, why[0] != '\0' ? why : "load failed",
                     sizeof(error->message));
         }
         delete program;
