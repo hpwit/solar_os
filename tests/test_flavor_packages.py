@@ -27,6 +27,18 @@ class FlavorPackagesTest(unittest.TestCase):
             self.catalog,
         )
 
+    def test_git_requires_wifi_and_psram(self):
+        _, _, groups, packages = self.resolve("full")
+        self.assertTrue(packages["service_git"])
+        for capabilities in ({"wifi", "psram"}, {"wifi"}, {"psram"}, set()):
+            with self.subTest(capabilities=capabilities):
+                selected_groups, selected = generate_flavor_config.apply_board_capability_pruning(
+                    self.catalog, groups, packages, capabilities)
+                supported = {"wifi", "psram"}.issubset(capabilities)
+                self.assertEqual(selected["service_git"], supported)
+                requires = generate_flavor_config.collect_requires(self.catalog, selected_groups, selected)
+                self.assertEqual("solaros_git" in requires, supported)
+
     def test_public_flavor_name_can_override_package_configuration_name(self):
         self.assertEqual(
             generate_flavor_config.public_flavor_name("full", "beta"),
@@ -123,7 +135,7 @@ class FlavorPackagesTest(unittest.TestCase):
             # These S3 boards route the native pair to fixed internal devices,
             # without a usable USB connector or expansion-header pair.
             eligible = target == "esp32s3" and path.stem not in {
-                "seeed_reterminal_sticky", "thinknode_m9",
+                "seeed_reterminal_sticky", "thinknode_m9", "seeed_reterminal_e1003",
             }
             with self.subTest(board=path.stem):
                 selected = generate_flavor_config.apply_target_pruning(
@@ -351,9 +363,11 @@ class FlavorPackagesTest(unittest.TestCase):
         self.assertTrue(headless["app_zoo"])
         self.assertTrue(headless["service_zoo"])
         self.assertTrue(headless["service_inference"])
+        self.assertTrue(headless["job_model_upload"])
         classic = generate_flavor_config.apply_target_pruning(self.catalog, packages, "esp32")
         self.assertFalse(classic["app_zoo"])
         self.assertFalse(classic["service_zoo"])
+        self.assertFalse(classic["job_model_upload"])
         for caps in ({"wifi"}, {"psram"}, set()):
             _, pruned = generate_flavor_config.apply_board_capability_pruning(self.catalog, groups, packages, caps)
             self.assertFalse(pruned["app_zoo"])
@@ -717,6 +731,11 @@ class FlavorPackagesTest(unittest.TestCase):
             "bq25896": "bq25896",
             "qmi8658": "qmi8658",
             "mpu6050": "mpu6050",
+            "m5ioe1": "m5ioe1",
+            "m5pm1": "m5pm1",
+            "rx8130": "rx8130",
+            "bmi270": "bmi270",
+            "ip2315": "ip2315",
         }
         for group, package in reusable.items():
             with self.subTest(group=group):
@@ -748,6 +767,11 @@ class FlavorPackagesTest(unittest.TestCase):
             "solar_os_bq25896_expansion_driver",
             "solar_os_qmi8658_expansion_driver",
             "solar_os_mpu6050_expansion_driver",
+            "solar_os_m5ioe1_expansion_driver",
+            "solar_os_m5pm1_expansion_driver",
+            "solar_os_rx8130_expansion_driver",
+            "solar_os_bmi270_expansion_driver",
+            "solar_os_ip2315_expansion_driver",
         ):
             self.assertIn(symbol, drivers)
 

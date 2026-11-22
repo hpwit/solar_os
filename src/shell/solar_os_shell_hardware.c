@@ -213,6 +213,19 @@ static void disk_print_status(solar_os_shell_io_t *term)
     solar_os_storage_get_status(status, sizeof(status));
     solar_os_shell_io_printf(term, "Disk: %s\n", status);
     solar_os_shell_io_printf(term, "Mount: %s\n", solar_os_storage_mount_point());
+    /* "Disk:" already shows the flash status unless the SD card is the
+     * default volume. */
+    if (!solar_os_storage_flash_is_mounted() && solar_os_storage_sd_is_mounted()) {
+        solar_os_storage_flash_get_status(status, sizeof(status));
+        solar_os_shell_io_printf(term, "Flash: %s\n", status);
+    }
+    if (solar_os_storage_flash_is_unrecognized()) {
+        solar_os_shell_io_writeln(term,
+            "Flash has no readable FAT volume (often another firmware's data; "
+            "also corruption or a read error). If it held SolarOS data, reboot "
+            "and check again before formatting. To erase it: "
+            "disk format flash --force");
+    }
 }
 
 static void disk_print_lsblk(solar_os_shell_io_t *term)
@@ -264,6 +277,14 @@ static bool disk_print_mounted_volume(solar_os_shell_io_t *term,
                                  block.mount_point);
         return true;
     }
+    for (size_t i = 0; i < solar_os_storage_mount_count(); i++) {
+        solar_os_storage_mount_info_t mount;
+        if (solar_os_storage_get_mount(i, &mount) &&
+            (!strcmp(name, mount.name) || !strcmp(name, mount.mount_point))) {
+            solar_os_shell_io_printf(term, "Disk: mounted %s at %s\n", mount.name, mount.mount_point);
+            return true;
+        }
+    }
     return false;
 }
 
@@ -272,7 +293,7 @@ static void disk_print_usage(solar_os_shell_io_t *term)
     solar_os_shell_io_writeln(term, "usage:");
     solar_os_shell_io_writeln(term, "  disk [status]");
     solar_os_shell_io_writeln(term, "  disk lsblk");
-    solar_os_shell_io_writeln(term, "  disk mount [flash|sd0pN|usb0] [mount]");
+    solar_os_shell_io_writeln(term, "  disk mount [volume] [mount]");
     solar_os_shell_io_writeln(term, "  disk mount <image.img> <mount> [partition 1-4]");
     solar_os_shell_io_writeln(term, "  disk create <image.img> <MiB>");
     solar_os_shell_io_writeln(term, "  disk umount [flash|sd0pN|usb0|imgN|mount]");
@@ -318,6 +339,9 @@ void solar_os_shell_cmd_disk(solar_os_context_t *ctx, int argc, char **argv)
 
     if (strcmp(argv[1], "mount") == 0 && argc >= 3 &&
         strcmp(argv[2], "flash") && strcmp(argv[2], "usb0") &&
+#if SOLAR_OS_PACKAGE_DRIVER_STORAGE_QEMU_HOST
+        strcmp(argv[2], "host") && strcmp(argv[2], "/host") &&
+#endif
         (strncmp(argv[2], "sd0", 3) || strchr(argv[2], '/') || strchr(argv[2], '.'))) {
         if (argc < 4 || argc > 5 || (argc == 5 && (strlen(argv[4]) != 1 || argv[4][0] < '1' || argv[4][0] > '4'))) {
             solar_os_shell_io_writeln(term, "usage: disk mount <image.img> <mount> [partition 1-4]");
@@ -336,7 +360,7 @@ void solar_os_shell_cmd_disk(solar_os_context_t *ctx, int argc, char **argv)
     if (strcmp(argv[1], "mount") == 0) {
         if (argc > 4) {
             solar_os_shell_diag_unexpected(term, "disk mount", argv[4],
-                                           "disk mount [flash|sd0pN|usb0] [mount]");
+                                           "disk mount [volume] [mount]");
             return;
         }
 
@@ -609,7 +633,8 @@ static void battery_print_monitor_status(solar_os_shell_io_t *term)
                              solar_os_battery_trend_name(monitor.trend),
                              monitor.external_power ?
                                 "external" :
-                                (monitor.trend == SOLAR_OS_BATTERY_TREND_DISCHARGING ?
+                                (monitor.external_power_known ||
+                                 monitor.trend == SOLAR_OS_BATTERY_TREND_DISCHARGING ?
                                     "battery" : "unknown"),
                              monitor.slope_mvh);
     if (monitor.time_left_valid) {
@@ -643,9 +668,9 @@ static void battery_print_status(solar_os_shell_io_t *term)
                              status.percent_estimated ? " estimated" : "",
                              status.adc_calibrated ? "" : " (uncalibrated ADC)");
     const char *power = status.external_power ? "external" : "unknown";
-    if (!status.external_power && status.charging_known && !status.charging) {
+    if (!status.external_power && status.external_power_known) {
         power = "battery";
-    } else if (!status.external_power && !status.charging_known) {
+    } else if (!status.external_power && !status.external_power_known) {
         solar_os_battery_monitor_status_t monitor;
         solar_os_battery_monitor_get_status(&monitor);
         if (monitor.running && monitor.trend == SOLAR_OS_BATTERY_TREND_DISCHARGING) {

@@ -2,6 +2,71 @@
 
 ## 4.x
 
+- **4.18.2** — 2026-11-20 — Added headless and display QEMU targets for
+  running SolarOS on a computer, with a serial console, shared host-directory
+  storage, and audio playback. The display target adds keyboard, touch and
+  mouse input, and networking. Added a Commodore 64 native app for ESP32-S3
+  boards with graphics and PSRAM, including built-in BASIC ROMs, PRG loading,
+  joystick controls, and SID audio. Fixed the default ST7789 display size to
+  320x240. Battery monitoring now uses hardware power-source status when
+  available and avoids low-voltage sleep or shutdown while external power is
+  present.
+- **4.18.1** — 2026-11-19 — Added Ukrainian, French and Romanian keyboard
+  layouts, dead-key composition, and Ctrl+Space switching between saved layouts,
+  with the active layout shown in the status bar. Improved UTF-8 text input and
+  rendering in Writer and the display shell. Added loadable Cyrillic and
+  extended Latin font packs for characters missing from the built-in fonts.
+  E-paper cursors now default to a steady block; fixed paging in terminal
+  settings. Added the optional AOgmaNeo online learning library for ESP32-S3
+  boards with executable PSRAM, with C, Python and Lua APIs for sequence
+  prediction, reinforcement learning, and image encoding and reconstruction.
+  Improved T-Deck Plus startup, documentation catalog loading, and message
+  history restoration speed. Fixed numbered list rendering and preservation in
+  Writer and Reader, and improved NTP synchronization when packets are lost.
+- **4.18.0** — 2026-11-17 — Added on-device C compilation for ESP32-S3
+  boards with PSRAM, including multi-file projects, installed library headers,
+  SDK browsing and header export. The compiler is included in the full flavor
+  and available as an optional firmware feature or installable package.
+  The editor now highlights C source files and headers.
+  Added Seeed Studio SenseCAP Watcher support with its round touchscreen,
+  wheel, Himax camera, microphone and speaker, microSD, RTC, and battery
+  monitoring. Watcher starts its shell on the display, supports BLE keyboards
+  and wheel-button wake, and leaves native USB off so expansion GPIO19/20
+  remain free. Added reusable PCA9535 GPIO expander, SPD2010 display/touch,
+  and ES7243/ES7243E microphone drivers. Added Photo with a live viewfinder,
+  JPEG capture from cameras or RTSP sources, and fullscreen operation; fixed
+  captured photo colors in View. Agent now accepts image questions from files,
+  camera streams, RTSP and pipeline results.
+  Added Python and Lua Agent APIs for text, images, and stored WAV/MP3 audio
+  questions, provider settings, and saved conversations. Audio input uses an
+  audio-capable Chat Completions model. Added Himax model programming, slot
+  selection, persistent slot inventory, and camera-bound inference pipelines.
+  Zoo now organizes models by target and supports offline inventory management.
+  USB mode switching now includes an off mode that releases exposed data pins
+  for general I/O. Fixed native USB serial enumeration when restoring device
+  mode. Improved full-panel media and emotion rendering, SPD2010 refresh
+  performance, and Python cleanup during cancellation. Reduced memory use
+  during shell completion and after closing port shells.
+- **4.17.12** — 2026-11-13 — Added Seeed Studio reTerminal E1003 support
+  with its 10.3-inch grayscale e-paper display, touch, microSD, microphone,
+  buzzer, battery and charger monitoring, RTC, and temperature/humidity sensor.
+  Added M5Stack Paper Mono support with e-paper, touch, frontlight, LoRa, NFC,
+  RTC, IMU, microSD, microphone, buzzer, battery and charger. Long-pressing
+  Button B shuts Paper Mono down cleanly. Improved Fastwave e-paper
+  responsiveness with automatic refresh pacing, black and white redrive controls, and
+  optional timed cleanup. E1003 graphics refreshes now run in the background
+  and avoid redundant full refreshes when switching between terminal and
+  graphics. Added TLS 1.3 support for HTTPS clients. Fixed saved profiles and
+  history not loading from built-in SPI microSD cards at startup. Storage now
+  clearly identifies unrecognized internal flash filesystems, and Messages
+  explains sends refused for untrusted or blocked contacts. Fixed SX1262 LoRa
+  low-data-rate optimization and reception after fast tuning; added a manual
+  low-data-rate optimization setting. PDM microphones with power control now
+  power down when idle.
+- **4.17.11** — 2026-11-13 — Added Git version control for small projects,
+  with SSH authentication, anonymous HTTPS cloning, branches, diffs and remote
+  synchronization. Git shows live progress and uses less internal RAM. New SSH
+  keys default to 3072-bit RSA. Fixed PS/2 keyboard job startup.
 - **4.17.10** — 2026-11-11 — Added USB hub support, report-protocol
   keyboards, and USB serial connections for CDC-ACM, Espressif native USB,
   CP210x, and CH340/CH341 devices. Flash can now program ESP boards over USB
