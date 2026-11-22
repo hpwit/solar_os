@@ -337,9 +337,10 @@
     },
     "src/services/solar_os_asm_runtime.cpp": {
       "calls": {
+        "heap_caps_malloc": 2,
         "new": 2
       },
-      "reason": "One compiled-script holder per run: asmparser2's ScriptExecutable is neither copyable nor movable, so it is constructed in place from the compiler's prvalue and deleted when the run ends."
+      "reason": "One compiled-script holder per run: asmparser2's ScriptExecutable is neither copyable nor movable, so it is constructed in place from the compiler's prvalue and deleted when the run ends. A script's machine code needs MALLOC_CAP_EXEC internal RAM, which no SolarOS memory class gives: one 26 KB block is set aside at boot (before the internal RAM is broken up) and lent to the loader, and a script it cannot hold falls back to MALLOC_CAP_EXEC directly (then PSRAM)."
     }
   }
 }

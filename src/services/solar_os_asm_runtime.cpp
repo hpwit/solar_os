@@ -15,18 +15,32 @@
 
 #include <new>
 
+#include "esp_heap_caps.h"
+#include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "solar_os_config.h"
+extern "C" {
+#include "solar_os_task.h"
+}
 
+#include "asm_execute.h"
 #include "binding.h"
 #include "script_executable.h"
 
+#if SOLAR_OS_PACKAGE_DRIVER_DISPLAY_RGB_LGFX
+#include "rgb_lgfx.h"
+#endif
 
 struct solar_os_asm_program {
     ScriptExecutable exe;
+    /* The task running the script (solar_os_asm_start()), and whether the
+     * script has returned. */
+    TaskHandle_t task;
+    volatile bool finished;
+    const char *function;
 };
 
 /* ------------------------------------------------------------ colours */
@@ -105,7 +119,7 @@ static script_crgb host_hsv(int h, int s, int v)
     return hsv_rainbow((uint8_t)h, (uint8_t)s, (uint8_t)v);
 }
 
-/* RGB565, byte-swapped like a frame buffer (display). */
+/* RGB565, byte-swapped like the frame buffer (display). */
 static uint16_t host_hsv2(int h, int s, int v)
 {
     const script_crgb c = hsv_rainbow((uint8_t)h, (uint8_t)s, (uint8_t)v);
@@ -149,6 +163,8 @@ static void host_reset_stat(void) {}
 #define HID_USAGE_LEFT 0x50
 #define HID_USAGE_DOWN 0x51
 #define HID_USAGE_UP 0x52
+#define HID_USAGE_ENTER 0x28
+#define HID_USAGE_TAB 0x2B
 #define KEY_RING 32
 
 /* Layout of keyboard.h's key_return: what `key`, keyChar and keyCode see. */
@@ -165,6 +181,9 @@ static volatile uint8_t s_read_head, s_read_tail;
 static volatile script_key s_cb_ring[KEY_RING];
 static volatile uint8_t s_cb_head, s_cb_tail;
 static ScriptExecutable *volatile s_keyboard_target;
+/* keyHeld(c): 1 while the key is down, by its readKey() character (arrows
+ * as z/q/s/d, letters in lower case, Enter '\r', Tab '\t'). */
+static volatile uint8_t s_held[256];
 
 static void host_setup_keyboard(uint32_t handle)
 {
@@ -181,6 +200,11 @@ static int host_read_key(void)
     const uint8_t c = s_read_ring[s_read_tail];
     s_read_tail = (uint8_t)((s_read_tail + 1) % KEY_RING);
     return c;
+}
+
+static int host_key_held(int c)
+{
+    return c >= 0 && c < 256 ? s_held[c] : 0;
 }
 
 static void push_read(uint8_t c)
@@ -200,6 +224,13 @@ extern "C" void solar_os_asm_key_event(uint8_t character, uint8_t usage, bool pr
     else if (usage == HID_USAGE_LEFT) c = 'q';
     else if (usage == HID_USAGE_DOWN) c = 's';
     else if (usage == HID_USAGE_RIGHT) c = 'd';
+    {
+        uint8_t h = c;
+        if (usage == HID_USAGE_ENTER) h = '\r';
+        else if (usage == HID_USAGE_TAB) h = '\t';
+        else if (h >= 'A' && h <= 'Z') h = (uint8_t)(h - 'A' + 'a');
+        s_held[h] = pressed ? 1 : 0;
+    }
     if (!pressed) {
         if (c >= 'A' && c <= 'Z') c = (uint8_t)(c - 'A' + 'a');
         if (c == 'z' || c == 'q' || c == 's' || c == 'd') {
@@ -227,6 +258,7 @@ extern "C" void solar_os_asm_keyboard_reset(void)
     s_cb_tail = 0;
     s_key.key_char = 0;
     s_key.key_code = 0;
+    memset((void *)s_held, 0, sizeof(s_held));
 }
 
 extern "C" void solar_os_asm_keyboard_pump(void)
@@ -240,6 +272,49 @@ extern "C" void solar_os_asm_keyboard_pump(void)
             (void)target->executeOnly("keyboard");
         }
     }
+}
+
+/* ------------------------------------------------------------ WAD */
+
+/* The WAD the app read next to the script (game.sc -> game.wad), for the
+ * scripts written for the asmparser2 Ironforge sketches: wad[] its bytes,
+ * wadLoaded 1 when there is one, wadFind("TITLEPIC") and
+ * wadSprite("HUSK", frame, angle) where a picture starts in wad[], -1 if
+ * none. A WAD: "PWAD", the number of entries, where the directory is; the
+ * directory: offset, size, an 8-character name each. */
+static uint8_t *s_wad;
+static int s_wad_loaded;
+
+extern "C" void solar_os_asm_set_wad(uint8_t *data)
+{
+    s_wad = data;
+    s_wad_loaded = data != NULL ? 1 : 0;
+}
+
+static int host_wad_find(const char *name)
+{
+    if (s_wad == NULL || name == NULL) {
+        return -1;
+    }
+    int32_t n, dir;
+    memcpy(&n, s_wad + 4, 4);
+    memcpy(&dir, s_wad + 8, 4);
+    for (int i = 0; i < n; i++) {
+        const uint8_t *e = s_wad + dir + 16 * i;
+        if (strncmp((const char *)e + 8, name, 8) == 0) {
+            int32_t pos;
+            memcpy(&pos, e, 4);
+            return pos;
+        }
+    }
+    return -1;
+}
+
+static int host_wad_sprite(const char *prefix, int frame, int angle)
+{
+    char name[9];
+    snprintf(name, sizeof(name), "%s%c%d", prefix, 'A' + frame, angle);
+    return host_wad_find(name);
 }
 
 /* ------------------------------------------------------------ parameters */
@@ -300,6 +375,10 @@ static float host_argf(int i)
 /* ------------------------------------------------------------ text */
 
 static solar_os_asm_text_fn s_text_out;
+/* True once the script called updateDisplay()/setPixelsize(): it drives the frames,
+ * so text is drawn into the back buffer like keyboard5inch's printscreen.
+ * Before that, each print is shown at once (a plain text console). */
+static volatile bool s_script_shows;
 
 extern "C" void solar_os_asm_set_text_output(solar_os_asm_text_fn fn)
 {
@@ -387,6 +466,7 @@ extern "C" bool solar_os_asm_uses_screen(const uint8_t *data, size_t size)
      * binary's relocation names: "@_ext_display", "@_updateDisplay(...)"). */
     static const char *const names[] = {
         "enableGraphicMode", "display", "updateDisplay", "setPixelsize",
+        "setResolution", "setCursor", "setDoubleBuffer",
         "printscreen", "triangle", "pixel", "scroll", "clear", "zoom", "stride",
     };
     if (data == NULL) {
@@ -415,19 +495,140 @@ extern "C" bool solar_os_asm_uses_screen(const uint8_t *data, size_t size)
     return false;
 }
 
-/* ------------------------------------------------------------ output */
+/* ------------------------------------------------------------ screen */
 
-/* enableGraphicMode(): on a board with a frame-buffer panel the script takes
- * the whole screen (see solar_os_asm_screen_begin()). This build has none, so
- * it does nothing: scripts that call it still compile and run, printing into
- * the terminal. */
+#if SOLAR_OS_PACKAGE_DRIVER_DISPLAY_RGB_LGFX
+static rgb_lgfx_t *s_panel;
+static uint32_t s_width, s_height, s_stride;
+static int s_sizex, s_sizey;
+static int s_zoom = 1;
+
+static void sync_size(void)
+{
+    s_sizex = (int)s_width;
+    s_sizey = (int)s_height;
+}
+
+static void host_update_display(void)
+{
+    s_script_shows = true;
+    rgb_lgfx_surface_show(s_panel);
+}
+
+static void host_clear(void)
+{
+    rgb_lgfx_surface_clear(s_panel);
+}
+
+/* setCursor(x, y): the next printf/printscreen text starts there (logical
+ * pixels), without clearing anything. */
+static void host_set_cursor(int x, int y)
+{
+    rgb_lgfx_surface_set_text_cursor(s_panel, x, y);
+}
+
+/* setResolution(M400x240): the resolution objects. Each holds the logical
+ * size and the two dividers of the 800 x 480 panel, M<width>x<height> with
+ * width 800/divx and height 480/divy, divx and divy 1..5 (25 objects). */
+SCRIPT_STRUCT(resolution, {
+    int width;
+    int height;
+    int divx;
+    int divy;
+})
+
+static resolution s_resolutions[RGB_LGFX_MAX_DIVIDER * RGB_LGFX_MAX_DIVIDER];
+static char s_resolution_names[RGB_LGFX_MAX_DIVIDER * RGB_LGFX_MAX_DIVIDER][12];
+
+/* The script passes the object by value, which reaches a bound function as
+ * its address. */
+/* setDoubleBuffer(0): draw straight on screen, updateDisplay() swaps
+ * nothing; setDoubleBuffer(1): the hidden buffer again (the default). */
+static void host_set_double_buffer(int on)
+{
+    rgb_lgfx_surface_set_double_buffer(s_panel, on != 0);
+}
+
+static void host_set_resolution(const resolution *r)
+{
+    if (r == NULL) {
+        return;
+    }
+    s_script_shows = true;
+    rgb_lgfx_surface_set_resolution(s_panel, r->divx, r->divy, &s_width, &s_height);
+    sync_size();
+}
+
+static void host_set_pixel_size(int size)
+{
+    s_script_shows = true;
+    rgb_lgfx_surface_set_pixel_size(s_panel, size, &s_width, &s_height);
+    sync_size();
+}
+
+static void host_triangle(int x0, int y0, int x1, int y1, int x2, int y2, uint16_t color)
+{
+    rgb_lgfx_surface_fill_triangle(s_panel, x0, y0, x1, y1, x2, y2, color);
+}
+
+/* keyboard5inch's pixel(x, y, hue): a zoom x zoom block, hue 0 = black. */
+static void host_pixel(int x, int y, int hue)
+{
+    uint16_t **slot = rgb_lgfx_surface_back_buffer_slot(s_panel);
+    if (slot == NULL || *slot == NULL) {
+        return;
+    }
+    const int zoom = s_zoom > 0 ? s_zoom : 1;
+    const uint16_t c = hue == 0 ? 0 : host_hsv2(hue, 255, 255);
+    for (int j = 0; j < zoom; j++) {
+        const int py = y * zoom + j;
+        if (py < 0 || py >= (int)s_height) continue;
+        for (int i = 0; i < zoom; i++) {
+            const int px = x * zoom + i;
+            if (px < 0 || px >= (int)s_width) continue;
+            (*slot)[(size_t)py * s_stride + (size_t)px] = c;
+        }
+    }
+}
+
+static void host_printscreen(const char *format, ...)
+{
+    /* Fixed buffer: a script task may be killed at any time, and must not be
+     * holding the heap lock when it is. */
+    char text[256];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(text, sizeof(text), format, args);
+    va_end(args);
+    rgb_lgfx_surface_print_ansi(s_panel, text);
+}
+#endif
+
+/* enableGraphicMode(): the script takes the whole screen now (if it does not
+ * have it yet). The terminal stops drawing until the script ends, and
+ * printf & co. go to the screen; tprintf/tprintln still go to the terminal
+ * transcript. Does nothing on a board without a frame-buffer panel. */
 static void host_enable_graphic_mode(void)
 {
-    (void)solar_os_asm_screen_begin();
+#if SOLAR_OS_PACKAGE_DRIVER_DISPLAY_RGB_LGFX
+    if (s_panel != NULL && !rgb_lgfx_surface_acquired(s_panel)) {
+        (void)solar_os_asm_screen_begin();
+    }
+#endif
 }
 
 static void text_emit(const char *text)
 {
+#if SOLAR_OS_PACKAGE_DRIVER_DISPLAY_RGB_LGFX
+    if (s_panel != NULL && rgb_lgfx_surface_acquired(s_panel)) {
+        if (s_script_shows) {
+            rgb_lgfx_surface_print_ansi(s_panel, text);
+        } else {
+            rgb_lgfx_surface_print_ansi_now(s_panel, text);
+        }
+        return;
+    }
+#endif
     if (s_text_out != NULL) {
         s_text_out(text);
     } else {
@@ -435,26 +636,158 @@ static void text_emit(const char *text)
     }
 }
 
+extern "C" bool solar_os_asm_file_uses_screen(FILE *file)
+{
+    /* Windows of 512 bytes, each starting 480 after the last: a name (17
+     * bytes at most) and what comes before it are whole in one of them. */
+    uint8_t window[512];
+    size_t kept = 0;
+    while (true) {
+        const size_t got = fread(window + kept, 1, sizeof(window) - kept, file);
+        if (got == 0) {
+            return false;
+        }
+        const size_t size = kept + got;
+        if (solar_os_asm_uses_screen(window, size)) {
+            return true;
+        }
+        kept = size > 32U ? 32U : size;
+        memmove(window, window + size - kept, kept);
+    }
+}
+
 extern "C" bool solar_os_asm_runtime_has_screen(void)
 {
+#if SOLAR_OS_PACKAGE_DRIVER_DISPLAY_RGB_LGFX
+    return rgb_lgfx_primary() != NULL;
+#else
     return false;
+#endif
 }
 
 extern "C" esp_err_t solar_os_asm_screen_begin(void)
 {
+#if SOLAR_OS_PACKAGE_DRIVER_DISPLAY_RGB_LGFX
+    if (s_panel == NULL) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    const esp_err_t err = rgb_lgfx_surface_acquire(s_panel);
+    if (err == ESP_OK) {
+        s_width = rgb_lgfx_width(s_panel);
+        s_height = rgb_lgfx_height(s_panel);
+        s_stride = rgb_lgfx_surface_stride(s_panel);
+        s_zoom = 1;
+        s_script_shows = false;
+        sync_size();
+        rgb_lgfx_surface_clear(s_panel);
+    }
+    return err;
+#else
     return ESP_ERR_NOT_SUPPORTED;
+#endif
 }
 
 extern "C" void solar_os_asm_screen_end(void)
 {
+#if SOLAR_OS_PACKAGE_DRIVER_DISPLAY_RGB_LGFX
+    /* Also after enableGraphicMode(); nothing to do when not acquired. */
+    if (s_panel != NULL && rgb_lgfx_surface_acquired(s_panel)) {
+        rgb_lgfx_surface_release(s_panel);
+    }
+#endif
+}
+
+/* ------------------------------------------------------------ code memory */
+
+/* A script's machine code needs one contiguous block of executable internal
+ * RAM. Once SolarOS has run a while, no free piece is big enough even for
+ * Valmora's 23.3 KB, so a block is set aside at boot and the loader gets it
+ * through setExecutableAllocator(). From PSRAM the code runs about as fast,
+ * but a script that redraws the whole 800x480 panel (Valmora) then shares
+ * the PSRAM bus with the panel's refresh, and the picture shakes. A larger
+ * script (Ironforge, 40.5 KB) goes to the heap, then to PSRAM. */
+#ifndef SOLAR_OS_ASM_EXECUTABLE_RESERVE_BYTES
+#define SOLAR_OS_ASM_EXECUTABLE_RESERVE_BYTES (26U * 1024U)
+#endif
+
+static void *s_exec_block;
+static bool s_exec_block_used;
+static portMUX_TYPE s_exec_lock = portMUX_INITIALIZER_UNLOCKED;
+
+extern "C" void solar_os_asm_reserve_executable(void)
+{
+    if (s_exec_block != NULL) {
+        return;
+    }
+    s_exec_block = heap_caps_malloc(SOLAR_OS_ASM_EXECUTABLE_RESERVE_BYTES, MALLOC_CAP_EXEC);
+    if (s_exec_block == NULL) {
+        ESP_LOGW("asm", "no %u bytes of executable memory to set aside for scripts",
+                 (unsigned)SOLAR_OS_ASM_EXECUTABLE_RESERVE_BYTES);
+    }
+}
+
+static void *exec_alloc(size_t size)
+{
+    bool mine = false;
+    portENTER_CRITICAL(&s_exec_lock);
+    if (s_exec_block != NULL && !s_exec_block_used && size <= SOLAR_OS_ASM_EXECUTABLE_RESERVE_BYTES) {
+        s_exec_block_used = true;
+        mine = true;
+    }
+    portEXIT_CRITICAL(&s_exec_lock);
+    return mine ? s_exec_block : heap_caps_malloc(size, MALLOC_CAP_EXEC);
+}
+
+static void exec_free(void *code)
+{
+    if (code != NULL && code == s_exec_block) {
+        portENTER_CRITICAL(&s_exec_lock);
+        s_exec_block_used = false;
+        portEXIT_CRITICAL(&s_exec_lock);
+    } else {
+        heap_caps_free(code);
+    }
+}
+
+extern "C" void solar_os_asm_set_compile_progress(solar_os_asm_progress_fn fn, void *ctx)
+{
+    setCompileProgress(fn, ctx);
+}
+
+extern "C" bool solar_os_asm_set_code_memory(solar_os_asm_code_memory_t where)
+{
+    return setScriptCodeMemory(where == SOLAR_OS_ASM_CODE_PSRAM  ? SCRIPT_CODE_PSRAM
+                               : where == SOLAR_OS_ASM_CODE_AUTO ? SCRIPT_CODE_AUTO
+                                                                 : SCRIPT_CODE_IRAM);
 }
 
 /* ------------------------------------------------------------ bindings */
 
+/* Every name a script can use without declaring it, for the editor's
+ * colouring and completion: the bindings below, as they are made, and the
+ * language's own built-ins. Sorted once binding is done. */
+#define KNOWN_MAX 160
+static solar_os_asm_known_t s_known[KNOWN_MAX];
+static size_t s_known_count;
+
+static void know(const char *name, const char *type, const char *params, bool function)
+{
+    if (s_known_count < KNOWN_MAX) {
+        s_known[s_known_count++] = (solar_os_asm_known_t){name, type, params, function};
+    }
+}
+
+static int known_order(const void *a, const void *b)
+{
+    return strcmp(((const solar_os_asm_known_t *)a)->name, ((const solar_os_asm_known_t *)b)->name);
+}
+
 #define BIND_F(out, name, in, fn) \
-    bindFunction((char *)(out), (char *)(name), (char *)(in), (void *)(fn))
+    (bindFunction((char *)(out), (char *)(name), (char *)(in), (void *)(fn)), \
+     know((name), (out), (in), true))
 #define BIND_V(type, name, ptr) \
-    bindVariable((char *)(type), (char *)(name), NULL, (void *)(ptr))
+    (bindVariable((char *)(type), (char *)(name), NULL, (void *)(ptr)), \
+     know((name), (type), NULL, false))
 
 extern "C" void solar_os_asm_runtime_init(void)
 {
@@ -463,6 +796,7 @@ extern "C" void solar_os_asm_runtime_init(void)
         return;
     }
     bound = true;
+    setExecutableAllocator(exec_alloc, exec_free);
 
     BIND_F("CRGB", "hsv", "int,int,int", host_hsv);
     BIND_F("uint16_t", "hsv2", "int,int,int", host_hsv2);
@@ -496,7 +830,95 @@ extern "C" void solar_os_asm_runtime_init(void)
     BIND_V("uint8_t", "keyCode", &s_key.key_code);
     /* The keyboard5inch scripts declare `struct return_key { char key; char val; }`. */
     BIND_V("return_key", "key", &s_key);
+    BIND_F("int", "keyHeld", "int", host_key_held);
 
+    BIND_V("uint8_t *", "wad", &s_wad);
+    BIND_V("int", "wadLoaded", &s_wad_loaded);
+    BIND_F("int", "wadFind", "char*", host_wad_find);
+    BIND_F("int", "wadSprite", "char*,int,int", host_wad_sprite);
+
+#if SOLAR_OS_PACKAGE_DRIVER_DISPLAY_RGB_LGFX
+    s_panel = rgb_lgfx_primary();
+    if (s_panel != NULL) {
+        s_width = rgb_lgfx_width(s_panel);
+        s_height = rgb_lgfx_height(s_panel);
+        s_stride = rgb_lgfx_surface_stride(s_panel);
+        sync_size();
+        /* A pointer, not an array: updateDisplay() swaps the frame buffers and the
+         * script reads display again at every access. */
+        BIND_V("uint16_t *", "display", rgb_lgfx_surface_back_buffer_slot(s_panel));
+        BIND_V("uint32_t", "width", &s_width);
+        BIND_V("uint32_t", "height", &s_height);
+        BIND_V("uint32_t", "stride", &s_stride);
+        BIND_V("int", "sizex", &s_sizex);
+        BIND_V("int", "sizey", &s_sizey);
+        BIND_V("int", "zoom", &s_zoom);
+        BIND_V("uint16_t", "scroll", rgb_lgfx_surface_scroll_slot(s_panel));
+        BIND_F("void", "updateDisplay", NULL, host_update_display);
+        BIND_F("void", "clear", NULL, host_clear);
+        BIND_F("void", "setCursor", "int,int", host_set_cursor);
+        BIND_F("void", "setPixelsize", "int", host_set_pixel_size);
+        bindStruct(resolution_definition);
+        for (int dy = 1; dy <= RGB_LGFX_MAX_DIVIDER; dy++) {
+            for (int dx = 1; dx <= RGB_LGFX_MAX_DIVIDER; dx++) {
+                const int i = (dy - 1) * RGB_LGFX_MAX_DIVIDER + (dx - 1);
+                resolution *r = &s_resolutions[i];
+                r->width = (int)(s_stride / (uint32_t)dx);
+                r->height = (int)(rgb_lgfx_height(s_panel) / (uint32_t)dy);
+                r->divx = dx;
+                r->divy = dy;
+                snprintf(s_resolution_names[i], sizeof(s_resolution_names[i]), "M%dx%d",
+                         r->width, r->height);
+                BIND_V("resolution", s_resolution_names[i], r);
+            }
+        }
+        BIND_F("void", "setResolution", "resolution", host_set_resolution);
+        BIND_F("void", "setDoubleBuffer", "int", host_set_double_buffer);
+        BIND_F("void", "pixel", "int,int,int", host_pixel);
+        BIND_F("void", "triangle", "int,int,int,int,int,int,uint16_t", host_triangle);
+        BIND_F("void", "printscreen", "char*,Args", host_printscreen);
+    }
+#endif
+    /* built into the language: every script has them, bound or not */
+    know("printf", "void", "char*,Args", true);
+    know("printfln", "void", "char*,Args", true);
+    know("alloc", "uint32_t", "int", true);
+    know("free", "void", "uint32_t", true);
+    know("writeInt", "void", "uint32_t,int,int", true);
+    know("readInt", "int", "uint32_t,int", true);
+    qsort(s_known, s_known_count, sizeof(s_known[0]), known_order);
+}
+
+extern "C" size_t solar_os_asm_known_names(const solar_os_asm_known_t **list)
+{
+    solar_os_asm_runtime_init();
+    if (list != NULL) {
+        *list = s_known;
+    }
+    return s_known_count;
+}
+
+extern "C" int solar_os_asm_known_kind(const char *word, size_t len)
+{
+    const solar_os_asm_known_t *list;
+    size_t lo = 0;
+    size_t hi = solar_os_asm_known_names(&list);
+    while (lo < hi) {
+        const size_t mid = (lo + hi) / 2;
+        int c = strncmp(list[mid].name, word, len);
+        if (c == 0 && list[mid].name[len] != '\0') {
+            c = 1;
+        }
+        if (c == 0) {
+            return list[mid].function ? 1 : 2;
+        }
+        if (c < 0) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return 0;
 }
 
 /* ------------------------------------------------------------ compile/run */
@@ -558,16 +980,21 @@ extern "C" esp_err_t solar_os_asm_load_source(const char *source,
     return ESP_OK;
 }
 
-extern "C" esp_err_t solar_os_asm_load_binary(const uint8_t *data, uint32_t size,
-                                              solar_os_asm_program_t **out,
-                                              solar_os_asm_error_t *error)
+static size_t file_reader(void *ctx, uint8_t *buf, size_t len)
 {
-    if (data == NULL || size == 0 || out == NULL) {
+    return fread(buf, 1, len, (FILE *)ctx);
+}
+
+extern "C" esp_err_t solar_os_asm_load_binary_file(FILE *file,
+                                                   solar_os_asm_program_t **out,
+                                                   solar_os_asm_error_t *error)
+{
+    if (file == NULL || out == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
     solar_os_asm_runtime_init();
     solar_os_asm_program_t *program =
-        new (std::nothrow) solar_os_asm_program_t{createExecutableFromBuffer(data, size)};
+        new (std::nothrow) solar_os_asm_program_t{createExecutableFromStream(file_reader, file)};
     if (program == NULL) {
         return ESP_ERR_NO_MEM;
     }
@@ -575,7 +1002,7 @@ extern "C" esp_err_t solar_os_asm_load_binary(const uint8_t *data, uint32_t size
         if (error != NULL) {
             memset(error, 0, sizeof(*error));
             error->failed = true;
-            /* asmparser2 says why: "missing binding: name, function()" (every
+            /* asmparser2 says why: "missing binding: led16, show16()" (every
              * name this firmware does not bind), "not a valid binary: ...",
              * or no executable memory. */
             const char *why = lastLoadError();
@@ -594,21 +1021,54 @@ extern "C" uint32_t solar_os_asm_code_size(const solar_os_asm_program_t *program
     return program != NULL ? program->exe.exe.binary_size : 0;
 }
 
+extern "C" bool solar_os_asm_code_in_psram(const solar_os_asm_program_t *program)
+{
+    return program != NULL && executableCodeMemory(&program->exe.exe) == SCRIPT_CODE_PSRAM;
+}
+
+/* The script runs on its own task, with its stack in PSRAM: internal RAM is
+ * what SolarOS runs short of (the code itself stays in the executable block
+ * set aside at boot), and a script never reaches the flash -- no binding
+ * writes a file -- which a task with a PSRAM stack must not. ESP-IDF's
+ * PSRAM stacks are cached, so deep recursion (fib) stays about as fast.
+ * Like ScriptExecutable::executeAsTask()'s task, it does not delete itself
+ * once the script returns: solar_os_asm_stop() does. */
+static void script_task(void *param)
+{
+    solar_os_asm_program_t *program = static_cast<solar_os_asm_program_t *>(param);
+    if (s_argc > 0) {
+        program->exe.execute(program->function, s_arg_raw, s_argc);
+    } else {
+        program->exe.execute(program->function);
+    }
+    program->finished = true;
+    while (true) {
+        vTaskSuspend(NULL);
+    }
+}
+
 extern "C" esp_err_t solar_os_asm_start(solar_os_asm_program_t *program,
                                         const char *function, uint32_t stack_bytes)
 {
     if (program == NULL || function == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-    return program->exe.executeAsTask(function, s_argc > 0 ? s_arg_raw : NULL, s_argc,
-                                      stack_bytes, 1, 1, "asm_script") ?
-        ESP_OK : ESP_FAIL;
+    solar_os_asm_stop(program);
+    program->function = function;
+    program->finished = false;
+    if (solar_os_task_create_pinned_external(script_task, "asm_script", stack_bytes, program, 1,
+                                             &program->task, 1,
+                                             SOLAR_OS_TASK_ROLE_FOREGROUND) != pdPASS) {
+        program->task = NULL;
+        program->finished = true;
+        return ESP_FAIL;
+    }
+    return ESP_OK;
 }
 
 extern "C" bool solar_os_asm_finished(const solar_os_asm_program_t *program)
 {
-    return program == NULL || program->exe.state() == ScriptState::stopped ||
-        program->exe.state() == ScriptState::notStarted;
+    return program == NULL || program->task == NULL || program->finished;
 }
 
 extern "C" void solar_os_asm_stop(solar_os_asm_program_t *program)
@@ -619,7 +1079,15 @@ extern "C" void solar_os_asm_stop(solar_os_asm_program_t *program)
     if (s_keyboard_target == &program->exe) {
         s_keyboard_target = NULL;
     }
-    (void)program->exe.kill();
+    TaskHandle_t task = program->task;
+    program->task = NULL;
+    if (task != NULL) {
+        /* As ScriptExecutable::kill(): the unwind point for a safe_mode
+         * error was on the task's stack, which is going away. */
+        program->exe.exe.runtimeUnwind = NULL;
+        solar_os_task_delete_external(task);
+    }
+    program->finished = true;
 }
 
 extern "C" bool solar_os_asm_runtime_error(solar_os_asm_program_t *program,

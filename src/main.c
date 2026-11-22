@@ -33,6 +33,9 @@
 #include "solar_os_buttons.h"
 #include "solar_os_cdc.h"
 #include "solar_os_config.h"
+#if SOLAR_OS_PACKAGE_APP_ASM
+#include "solar_os_asm_runtime.h"
+#endif
 #if SOLAR_OS_PACKAGE_SERVICE_USB_HOST
 #include "solar_os_usb.h"
 #endif
@@ -2450,6 +2453,11 @@ void app_main(void)
 {
     ESP_ERROR_CHECK(solar_os_board_boot_init());
     solar_os_memory_init();
+#if SOLAR_OS_PACKAGE_APP_ASM
+    /* Before anything breaks up the internal RAM: a script's code needs one
+     * contiguous executable block. */
+    solar_os_asm_reserve_executable();
+#endif
     ESP_ERROR_CHECK(init_nvs());
 #if SOLAR_OS_PACKAGE_SERVICE_BLE
     if (board_has(SOLAR_OS_BOARD_CAP_BLE)) {

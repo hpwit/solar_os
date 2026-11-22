@@ -13,7 +13,7 @@ file(GLOB ASMPARSER2_SRCS "${CMAKE_CURRENT_LIST_DIR}/src/*.cpp")
 idf_component_register(
     SRCS ${ASMPARSER2_SRCS}
     INCLUDE_DIRS "src"
-    REQUIRES freertos heap esp_timer xtensa
+    REQUIRES freertos heap esp_timer xtensa esp_mm
 )
 
 # The library guards its FreeRTOS/heap_caps code on ESP32, which Arduino

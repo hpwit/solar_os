@@ -1,4 +1,5 @@
 #include "optimize.h"
+#include "compile_progress.h"
 #include "parser_define.h"
 #include "string_functions.h"
 #include "vect.h"
@@ -200,6 +201,7 @@ void optimize(Text *text)
     // invalidated it.
     for (int regnum = 3; regnum < 11; regnum++)
     {
+        compileProgressStep(regnum - 3, 8);
         char *registername = string_format("a%d", regnum);
         char *str = ownedCopy("__");
         char base[8] = "";
@@ -578,7 +580,7 @@ void optimize(Text *text)
                 trackRemoveAt(from, to, index, ind);
         }
         else if ((strcmp(op, "neg") == 0 || strcmp(op, "abs") == 0 || strcmp(op, "mov") == 0 ||
-                  strcmp(op, "sll") == 0 || strcmp(op, "srl") == 0) &&
+                  strcmp(op, "sll") == 0 || strcmp(op, "srl") == 0 || strcmp(op, "sra") == 0) &&
                  d.size() > 1)
         {
             SplitResult d2(d.get(1), ",");
@@ -1482,6 +1484,7 @@ void preserveAcrossCalls(Text *text)
     int i = 0;
     while (i < text->size())
     {
+        compileProgressStep(i, text->size());
         trimmedLine(*text->getChildAtPos(i), line, sizeof(line));
         if (strncmp(line, "entry a1,", 9) != 0)
         {
@@ -2422,6 +2425,14 @@ static bool rangeHasCall(LineFlow *f, int lo, int hi)
     return false;
 }
 
+// The registers a call changes: a8..a15 (the callee's window, a10 its
+// result) and the float registers. registerUseDef() counts a call as
+// writing nothing, so a loop with a call must not take a value read from
+// one of these as unchanged through it: `addx4 a5,a10,a10` after
+// `call8 @_ix(...)` was moved before the loop, and every pass of the loop
+// used the a10 of before it (fuzz seed 251).
+#define CALL_CLOBBERED 0xFFFFFF00u
+
 // Keeps frame slots and loop-invariant l32r/movi loads in registers of
 // lines start..end-1 (one function). Returns how many lines it inserted.
 // What an `l32r aX,@sym`, `movi aX,N` or pure computation (`slli aX,aY,k`,
@@ -2523,7 +2534,8 @@ static int allocateFunction(Text *text, int start, int end)
                 // every source must hold the same value all through
                 // (use[i] also has the destination when it is a source)
                 uint32_t dst = f.def[i];
-                if ((f.use[i] & loopDef) != 0 || (f.use[i] & dst) != 0 || dst == 0)
+                if ((f.use[i] & loopDef) != 0 || (f.use[i] & dst) != 0 || dst == 0 ||
+                    ((f.use[i] & CALL_CLOBBERED) != 0 && rangeHasCall(&f, k, b)))
                     continue;
             }
             int c = 0;
@@ -3102,7 +3114,8 @@ static int hoistInvariantLines(Text *text, int start, int end)
             if (!loopInvariantLoad(f.line[i], sym, sizeof(sym), &kind, opname))
                 continue;
             uint32_t x = f.def[i];
-            if (x == 0 || (x & (x - 1)) != 0 || (f.use[i] & loopDef) != 0 || (f.use[i] & x) != 0)
+            if (x == 0 || (x & (x - 1)) != 0 || (f.use[i] & loopDef) != 0 || (f.use[i] & x) != 0 ||
+                (hasCall && (f.use[i] & CALL_CLOBBERED) != 0))
                 continue;
             int defs = 0;
             for (int j = k; j <= b; j++)
@@ -3227,6 +3240,7 @@ void allocateLoopRegisters(Text *text)
     int i = 0;
     while (i < text->size())
     {
+        compileProgressStep(i, text->size());
         trimmedLine(*text->getChildAtPos(i), line, sizeof(line));
         if (!isFunctionLabel(line))
         {

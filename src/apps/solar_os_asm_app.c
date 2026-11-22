@@ -1,16 +1,20 @@
 /*
  * asm: ESPLiveScript 2 (asmparser2) from the shell.
  *
- *   asm run [-f function] <file.sc|file.bin> [params...]
+ *   asm run [-p|-i] [-f function] <file.sc|file.bin> [params...]
+ *            (the script's code in internal RAM, or PSRAM when no block is
+ *            free; -p: always PSRAM, -i: always internal RAM)
  *                                           compile or load, then run; up to
- *                                           6 int/float/text params go to the
- *                                           function and to argc/arg()/argf()/argstr()
+ *                                           6 int/float params go to the
+ *                                           function and to argc/arg()/argf()
  *   asm compile <file.sc> [-o <file.bin>]   compile; with -o also save
  *   asm save <file.sc> [<file.bin>]         compile and save the binary
  *
  * The compiler and the script run on a worker task; the app task only
- * forwards keys and prints the worker's messages. A running script stops
- * when it returns, or with the app exit key or Ctrl-C.
+ * forwards keys and prints the worker's messages. On boards with the
+ * rgb-lgfx panel a running script owns the whole frame buffer (display,
+ * updateDisplay(), ...) until it returns or is stopped with the app exit key or
+ * Ctrl-C.
  */
 #include "solar_os_asm_app.h"
 
@@ -62,6 +66,7 @@ typedef struct {
     char in_path[SOLAR_OS_STORAGE_PATH_MAX];
     char out_path[SOLAR_OS_STORAGE_PATH_MAX];
     char function[48];
+    solar_os_asm_code_memory_t code_memory; /* asm run -p, -i */
     QueueHandle_t messages;
     TaskHandle_t task;
     volatile bool task_done;
@@ -80,7 +85,7 @@ static solar_os_shell_io_t *asm_io(solar_os_context_t *ctx)
 
 static void asm_usage(solar_os_shell_io_t *io)
 {
-    solar_os_shell_io_writeln(io, "asm run [-f function] <file.sc|file.bin> [params...]   compile or load, then run");
+    solar_os_shell_io_writeln(io, "asm run [-p|-i] [-f function] <file.sc|file.bin> [params...]   compile or load, then run (-p: the code in PSRAM, -i: in internal RAM)");
     solar_os_shell_io_writeln(io, "        params (up to 6: int, float or text) go to main() and to argc/arg(i)/argf(i)/argstr(i)");
     solar_os_shell_io_writeln(io, "asm compile <file.sc> [-o <file.bin>]   compile; with -o also save the binary");
     solar_os_shell_io_writeln(io, "asm save <file.sc> [<file.bin>]         compile and save (default: same name .bin)");
@@ -98,6 +103,31 @@ static void post(bool done, const char *fmt, ...)
         vsnprintf(message.text, sizeof(message.text), fmt, args);
         va_end(args);
     }
+    (void)xQueueSend(S.messages, &message, pdMS_TO_TICKS(1000));
+}
+
+/* The compile's progress on one terminal line, rewritten in place:
+ * "compiling game.sc...  48% optimizing". */
+static void compile_progress(int percent, const char *stage, void *ctx)
+{
+    (void)ctx;
+    asm_message_t message = {.raw = true};
+    snprintf(message.text, sizeof(message.text), "\rcompiling %s... %3d%% %-10s", S.in_path, percent, stage);
+    (void)xQueueSend(S.messages, &message, pdMS_TO_TICKS(100));
+}
+
+static void compile_progress_begin(void)
+{
+    compile_progress(0, "reading", NULL);
+    solar_os_asm_set_compile_progress(compile_progress, NULL);
+}
+
+/* the progress line is left as it ended; the next messages start below */
+static void compile_progress_end(void)
+{
+    solar_os_asm_set_compile_progress(NULL, NULL);
+    asm_message_t message = {.raw = true};
+    strlcpy(message.text, "\n", sizeof(message.text));
     (void)xQueueSend(S.messages, &message, pdMS_TO_TICKS(1000));
 }
 
@@ -171,10 +201,11 @@ static bool worker_compile(void)
     solar_os_asm_error_t error = {0};
     uint8_t *binary = NULL;
     uint32_t binary_size = 0;
-    post(false, "compiling %s...", S.in_path);
+    compile_progress_begin();
     const int64_t started = esp_timer_get_time();
     const esp_err_t err = solar_os_asm_compile_binary(source, &binary, &binary_size, &error);
     const int64_t elapsed_ms = (esp_timer_get_time() - started) / 1000;
+    compile_progress_end();
     solar_os_memory_free(source);
     if (err != ESP_OK) {
         post_compile_error(&error);
@@ -210,25 +241,74 @@ static void asm_text_out(const char *text)
     (void)xQueueSend(S.messages, &message, pdMS_TO_TICKS(1000));
 }
 
-static bool worker_run(void)
+/* game.sc or game.bin -> game.wad next to it, read for wad[] & co. (see
+ * solar_os_asm_set_wad()); NULL when there is none. */
+static uint8_t *read_wad(void)
+{
+    char path[SOLAR_OS_STORAGE_PATH_MAX];
+    strlcpy(path, S.in_path, sizeof(path));
+    char *dot = strrchr(path, '.');
+    char *slash = strrchr(path, '/');
+    if (dot == NULL || (slash != NULL && dot < slash) ||
+        (size_t)(dot - path) + 5U > sizeof(path)) {
+        return NULL;
+    }
+    strcpy(dot, ".wad");
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        return NULL;
+    }
+    size_t size = 0;
+    uint8_t *wad = read_file(path, &size, false);
+    if (wad != NULL && (size < 12U || memcmp(wad + 1, "WAD", 3) != 0)) {
+        post(false, "asm: %s is not a WAD", path);
+        solar_os_memory_free(wad);
+        return NULL;
+    }
+    if (wad != NULL) {
+        post(false, "%s: %u bytes", path, (unsigned)size);
+    }
+    return wad;
+}
+
+static bool worker_run_loaded(void)
 {
     const bool binary = has_suffix(S.in_path, ".bin");
-    size_t size = 0;
-    uint8_t *data = read_file(S.in_path, &size, !binary);
-    if (data == NULL) {
-        return false;
-    }
     solar_os_asm_error_t error = {0};
     solar_os_asm_program_t *program = NULL;
-    /* A text-only script (no screen binding) leaves the terminal in place
-     * and prints into it, like a DOS program. */
-    const bool wants_screen = solar_os_asm_uses_screen(data, size);
-    post(false, "%s %s...", binary ? "loading" : "compiling", S.in_path);
-    const int64_t started = esp_timer_get_time();
-    esp_err_t err = binary ?
-        solar_os_asm_load_binary(data, (uint32_t)size, &program, &error) :
-        solar_os_asm_load_source((const char *)data, &program, &error);
-    solar_os_memory_free(data);
+    bool wants_screen;
+    esp_err_t err;
+    int64_t started;
+    if (binary) {
+        /* A saved binary is streamed from the flash or the SD card: its code
+         * goes from the file into executable memory, the file is never held
+         * whole. */
+        FILE *f = fopen(S.in_path, "rb");
+        if (f == NULL) {
+            post(false, "asm: cannot open %s", S.in_path);
+            return false;
+        }
+        /* A text-only script (no screen binding) leaves the terminal in
+         * place and prints into it, like a DOS program. */
+        wants_screen = solar_os_asm_file_uses_screen(f);
+        rewind(f);
+        post(false, "loading %s...", S.in_path);
+        started = esp_timer_get_time();
+        err = solar_os_asm_load_binary_file(f, &program, &error);
+        fclose(f);
+    } else {
+        size_t size = 0;
+        uint8_t *data = read_file(S.in_path, &size, true);
+        if (data == NULL) {
+            return false;
+        }
+        wants_screen = solar_os_asm_uses_screen(data, size);
+        compile_progress_begin();
+        started = esp_timer_get_time();
+        err = solar_os_asm_load_source((const char *)data, &program, &error);
+        compile_progress_end();
+        solar_os_memory_free(data);
+    }
     if (err != ESP_OK) {
         if (binary) {
             post(false, "asm: %s: %s", S.in_path, error.message);
@@ -237,14 +317,17 @@ static bool worker_run(void)
         }
         return false;
     }
-    post(false, "%s done in %lld ms (%u bytes of code)",
+    post(false, "%s done in %lld ms (%u bytes of code, in %s)",
          binary ? "load" : "compile",
          (long long)((esp_timer_get_time() - started) / 1000),
-         (unsigned)solar_os_asm_code_size(program));
+         (unsigned)solar_os_asm_code_size(program),
+         solar_os_asm_code_in_psram(program) ? "PSRAM" : "internal RAM");
 
     const bool screen = wants_screen && solar_os_asm_screen_begin() == ESP_OK;
     solar_os_asm_set_text_output(asm_text_out);
     solar_os_asm_keyboard_reset();
+    uint8_t *wad = read_wad();
+    solar_os_asm_set_wad(wad);
     err = solar_os_asm_start(program, S.function, ASM_SCRIPT_STACK);
     if (err != ESP_OK) {
         post(false, "asm: cannot start %s()", S.function);
@@ -272,6 +355,24 @@ static bool worker_run(void)
     solar_os_asm_set_text_output(NULL);
     solar_os_asm_keyboard_reset();
     solar_os_asm_free(program);
+    solar_os_asm_set_wad(NULL);
+    solar_os_memory_free(wad);
+    return ok;
+}
+
+/* This run's code memory, then internal RAM again. Without PSRAM code
+ * (not an ESP32-S3), AUTO is internal RAM. */
+static bool worker_run(void)
+{
+    if (!solar_os_asm_set_code_memory(S.code_memory)) {
+        if (S.code_memory == SOLAR_OS_ASM_CODE_PSRAM) {
+            post(false, "asm: -p: this board can't run code from PSRAM");
+            return false;
+        }
+        (void)solar_os_asm_set_code_memory(SOLAR_OS_ASM_CODE_IRAM);
+    }
+    const bool ok = worker_run_loaded();
+    (void)solar_os_asm_set_code_memory(SOLAR_OS_ASM_CODE_IRAM);
     return ok;
 }
 
@@ -328,19 +429,31 @@ static esp_err_t asm_start(solar_os_context_t *ctx)
         return ESP_OK;
     }
     strlcpy(S.function, "main", sizeof(S.function));
+    S.code_memory = SOLAR_OS_ASM_CODE_AUTO;
     if (strcmp(verb, "run") == 0) {
-        /* asm run [-f function] <file> [params...] */
+        /* asm run [-p|-i] [-f function] <file> [params...] */
         S.mode = ASM_MODE_RUN;
         int index = 2;
-        if (strcmp(file, "-f") == 0) {
-            if (argc < 5) {
-                asm_usage(io);
-                solar_os_context_finish(ctx, 2, NULL);
-                return ESP_OK;
+        while (file != NULL &&
+               (strcmp(file, "-p") == 0 || strcmp(file, "-i") == 0 || strcmp(file, "-f") == 0)) {
+            if (strcmp(file, "-p") == 0 || strcmp(file, "-i") == 0) {
+                S.code_memory = file[1] == 'p' ? SOLAR_OS_ASM_CODE_PSRAM : SOLAR_OS_ASM_CODE_IRAM;
+                index += 1;
+            } else {
+                if (index + 2 >= argc) {
+                    asm_usage(io);
+                    solar_os_context_finish(ctx, 2, NULL);
+                    return ESP_OK;
+                }
+                strlcpy(S.function, solar_os_context_argv(ctx, index + 1), sizeof(S.function));
+                index += 2;
             }
-            strlcpy(S.function, solar_os_context_argv(ctx, 3), sizeof(S.function));
-            index = 4;
-            file = solar_os_context_argv(ctx, 4);
+            file = solar_os_context_argv(ctx, index);
+        }
+        if (file == NULL) {
+            asm_usage(io);
+            solar_os_context_finish(ctx, 2, NULL);
+            return ESP_OK;
         }
         for (int k = index + 1; k < argc && param_count < SOLAR_OS_ASM_ARGS_MAX; k++) {
             params[param_count++] = solar_os_context_argv(ctx, k);
