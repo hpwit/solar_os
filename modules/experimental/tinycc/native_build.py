@@ -76,7 +76,9 @@ def main():
     # Declarations precede the single-source compiler includes.
     (source / "embedded-hook.h").write_text("void solar_os_cc_checkpoint(void);\nconst char *solar_os_cc_source_name(void);\n")
     output = CACHE / "native"; output.mkdir(parents=True, exist_ok=True)
-    cc = Path.home() / ".platformio/packages/toolchain-xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc"
+    # PlatformIO's packages: its own core directory when one is set
+    core = Path(os.environ.get("PLATFORMIO_CORE_DIR", str(Path.home() / ".platformio")))
+    cc = core / "packages/toolchain-xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc"
     prefix = str(cc)[:-3]
     flags = ["-std=gnu11", "-Os", "-g0", "-fPIC", "-fvisibility=hidden", "-ffunction-sections",
              "-fno-asynchronous-unwind-tables", "-fno-unwind-tables", "-fno-builtin",
@@ -85,7 +87,7 @@ def main():
     # attributes; it has no configured ESP-IDF runtime dependencies.
     (output / "sdkconfig.h").write_text("#pragma once\n")
     flags += ["-I" + str(ROOT / "src/services"), "-I" + str(output),
-              "-I" + str(Path.home() / ".platformio/packages/framework-espidf/components/esp_common/include")]
+              "-I" + str(core / "packages/framework-espidf/components/esp_common/include")]
     run(cc, *flags, "-finstrument-functions", "-DTCC_TARGET_XTENSA=1", "-DCONFIG_TCC_STATIC=1",
         "-DCONFIG_TCC_SEMLOCK=0", "-DCONFIG_TCC_BACKTRACE=0", "-DCONFIG_TCC_BCHECK=0",
         "-include", source / "embedded-hook.h", "-c", source / "libtcc.c", "-o", output / "core.raw.o")

@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -114,7 +115,7 @@ def main():
     run("cc", "-std=c11", "-O2", "-include", "stdbool.h", "-I", ROOT / "tests/host",
         "-I", ROOT / "include", "-I", ROOT / "src/services",
         HERE / "elf_check.c", ROOT / "src/services/solar_os_native_elf.c", "-o", CACHE / "elf-check")
-    cc = Path.home() / ".platformio/packages/toolchain-xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc"
+    cc = Path(os.environ.get("PLATFORMIO_CORE_DIR", str(Path.home() / ".platformio"))) / "packages/toolchain-xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc"
     if args.s3_check:
         cross_flags = flags[:1] + ["-Os", "-g0", "-fPIC", "-ffunction-sections", "-fdata-sections",
                                   "-fstack-usage", *flags[3:]]

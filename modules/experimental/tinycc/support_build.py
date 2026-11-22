@@ -1,6 +1,7 @@
 """Pack a closed, GCC-built runtime into TinyCC section/word relocations."""
 import hashlib
 import json
+import os
 from pathlib import Path
 import struct
 import subprocess
@@ -8,7 +9,7 @@ import subprocess
 
 def prepare_support(here, cache, source):
     output=cache / "support"; output.mkdir(exist_ok=True)
-    cc=Path.home()/".platformio/packages/toolchain-xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc"
+    cc=Path(os.environ.get("PLATFORMIO_CORE_DIR", str(Path.home() / ".platformio"))) / "packages/toolchain-xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc"
     prefix=str(cc)[:-3]
     def run(*args): subprocess.run(list(map(str,args)),check=True,timeout=120)
     flags=["-std=c11","-Os","-fPIC","-mlongcalls","-ffp-contract=off","-fno-unwind-tables","-fno-asynchronous-unwind-tables"]
