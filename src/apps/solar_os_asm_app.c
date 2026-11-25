@@ -47,6 +47,8 @@
 #define ASM_MESSAGE_MAX 200
 #define ASM_MESSAGE_QUEUE_LEN 48
 #define ASM_SOURCE_MAX (512U * 1024U)
+/* A game's WAD (its art and levels) goes to PSRAM: Driftwing's is 1.6 MB. */
+#define ASM_WAD_MAX (4U * 1024U * 1024U)
 #define ASM_CTRL_C 0x03
 
 typedef enum {
@@ -150,7 +152,7 @@ static void post_compile_error(const solar_os_asm_error_t *error)
     }
 }
 
-static uint8_t *read_file(const char *path, size_t *size, bool text)
+static uint8_t *read_file(const char *path, size_t *size, bool text, size_t max)
 {
     FILE *f = fopen(path, "rb");
     if (f == NULL) {
@@ -158,8 +160,8 @@ static uint8_t *read_file(const char *path, size_t *size, bool text)
         return NULL;
     }
     struct stat st;
-    if (fstat(fileno(f), &st) != 0 || st.st_size <= 0 || (size_t)st.st_size > ASM_SOURCE_MAX) {
-        post(false, "asm: %s: empty or larger than %u bytes", path, (unsigned)ASM_SOURCE_MAX);
+    if (fstat(fileno(f), &st) != 0 || st.st_size <= 0 || (size_t)st.st_size > max) {
+        post(false, "asm: %s: empty or larger than %u bytes", path, (unsigned)max);
         fclose(f);
         return NULL;
     }
@@ -194,7 +196,7 @@ static bool has_suffix(const char *path, const char *suffix)
 static bool worker_compile(void)
 {
     size_t size = 0;
-    char *source = (char *)read_file(S.in_path, &size, true);
+    char *source = (char *)read_file(S.in_path, &size, true, ASM_SOURCE_MAX);
     if (source == NULL) {
         return false;
     }
@@ -259,7 +261,7 @@ static uint8_t *read_wad(void)
         return NULL;
     }
     size_t size = 0;
-    uint8_t *wad = read_file(path, &size, false);
+    uint8_t *wad = read_file(path, &size, false, ASM_WAD_MAX);
     if (wad != NULL && (size < 12U || memcmp(wad + 1, "WAD", 3) != 0)) {
         post(false, "asm: %s is not a WAD", path);
         solar_os_memory_free(wad);
@@ -298,7 +300,7 @@ static bool worker_run_loaded(void)
         fclose(f);
     } else {
         size_t size = 0;
-        uint8_t *data = read_file(S.in_path, &size, true);
+        uint8_t *data = read_file(S.in_path, &size, true, ASM_SOURCE_MAX);
         if (data == NULL) {
             return false;
         }
