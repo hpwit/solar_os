@@ -114,6 +114,9 @@ public:
     // For a short conditional branch, the bits of its offset (8 or 12), so
     // that the assembler can check it reached; 0 otherwise.
     uint8_t branchBits = 0;
+    // A loop/loopnez/loopgtz: padded with a nop.n when needed so that the
+    // loop body, which starts right after it, doesn't straddle either.
+    bool loopStart = false;
 };
 
 // The assembled lines, in one array (not one heap block each: on the ESP32
@@ -167,8 +170,9 @@ struct Binary
     asm_error_message_struct error;
     uint8_t *binary_data = NULL;
     uint8_t *function_data = NULL;
-    uint16_t instruction_size = 0;
-    uint16_t tmp_instruction_size = 0;
+    // 32 bits: a large script's code passes 64KB
+    uint32_t instruction_size = 0;
+    uint32_t tmp_instruction_size = 0;
     uint16_t function_size = 0;
     // 32 bits: a script's globals can pass 64KB (`uint8_t copy[480, 800]`
     // for an 800x480 screen is 384000 bytes).

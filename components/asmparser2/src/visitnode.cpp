@@ -1044,23 +1044,48 @@ void _visitoperatorNode(NodeToken *nd)
     }
     break;
     case TokenShiftLeft:
-        // bufferText->addAfter("movi a8,32");
-        // bufferText->addAfter(string_format("sub a%d,a8,a%d",register_numr.get(),register_numr.get()).c_str());
-        bufferText->addAfter(string_format(ssl, register_numr.get()));
-        bufferText->addAfter(string_format(sll, register_numl.get(), register_numl.get()));
-        break;
     case TokenShiftRight:
-        // bufferText->addAfter("movi a8,32");
-        // bufferText->addAfter(string_format("sub a%d,a8,a%d",register_numr.get(),register_numr.get()).c_str());
-        bufferText->addAfter(string_format(wsr, register_numr.get(), 3));
+    {
+        bool right = nd->type == TokenShiftRight;
         // Signed unless the value shifted is uint32_t, as in C: `-54 >> 1`
         // is -27. It was always unsigned (srl), which gave 2147483621. A
         // uint32_t anywhere in the left operand makes it unsigned, as C's
         // conversions do for (u + 1) >> 8; uint8_t and uint16_t values are
         // never negative, so only int changes.
-        bufferText->addAfter(string_format((l == __uint32_t__ || containsValueOfType(nd->getChildPtr(0), __uint32_t__)) ? srl : sra,
-                                           register_numl.get(), register_numl.get()));
-        break;
+        bool logical = right && (l == __uint32_t__ || containsValueOfType(nd->getChildPtr(0), __uint32_t__));
+        // A constant amount (`w >> 7`, `i << 5`): its movi just before is
+        // replaced by the shift's immediate form -- one instruction instead
+        // of movi, wsr/ssl and the shift (these are the inner loops of
+        // anything drawn pixel by pixel). srli only takes 0..15.
+        char *_last = bufferText->current();
+        char *tocmp = string_format("movi a%d,", register_numr.get());
+        int k = -1;
+        if (strncmp(_last, tocmp, strlen(tocmp)) == 0)
+        {
+            int a;
+            if (sscanf(_last, "movi a%d,%d", &a, &k) != 2 || k < 0 || k > 31 || (logical && k > 15))
+                k = -1;
+        }
+        free(tocmp);
+        if (k >= 0)
+        {
+            bufferText->blankCurrent();
+            if (k > 0)
+                bufferText->addAfter(string_format("%s a%d,a%d,%d", right ? (logical ? "srli" : "srai") : "slli",
+                                                   register_numl.get(), register_numl.get(), k));
+        }
+        else if (right)
+        {
+            bufferText->addAfter(string_format(wsr, register_numr.get(), 3));
+            bufferText->addAfter(string_format(logical ? srl : sra, register_numl.get(), register_numl.get()));
+        }
+        else
+        {
+            bufferText->addAfter(string_format(ssl, register_numr.get()));
+            bufferText->addAfter(string_format(sll, register_numl.get(), register_numl.get()));
+        }
+    }
+    break;
     case TokenSubstraction:
     {
         if (ff)
@@ -1116,11 +1141,65 @@ void _visitoperatorNode(NodeToken *nd)
         }
         else
         {
-            // asmInstr = quou;
             if (l == __uint32_t__ || r == __uint32_t__)
                 asmInstr = quou;
             else
                 asmInstr = quos;
+            // A division by a constant power of two needs no divider (the
+            // ESP32's quou/quos take tens of cycles): the same "peek at
+            // the movi that just loaded the right operand" trick as
+            // TokenStar's below. Unsigned is one srli. Signed must round
+            // toward zero as quos does (a bare srai rounds toward minus
+            // infinity), so the divisor minus one is added first when the
+            // dividend is negative: srai takes its sign (all ones or
+            // zeros), srli keeps its low bits -- four single-cycle
+            // instructions, through the divisor's register, free once its
+            // movi is blanked.
+            {
+                char *_last = bufferText->current();
+                char *tocmp = string_format("movi a%d,", register_numr.get());
+                if (strncmp(_last, tocmp, strlen(tocmp)) == 0)
+                {
+                    int a, b;
+                    if (sscanf(_last, "movi a%d,%d", &a, &b) == 2 && b > 0 && (b & (b - 1)) == 0)
+                    {
+                        int shift = 0;
+                        while ((1 << shift) < b)
+                            shift++;
+                        // srli's field is 4 bits: a shift of 16..31 goes
+                        // through extui (the top 32-shift bits)
+                        if (asmInstr != quou && shift > 16)
+                        {
+                            // the correction mask would need a 17+-bit
+                            // extract: the divider keeps those rare ones
+                            free(tocmp);
+                            bufferText->addAfter(string_format(asmInstr, register_numl.get(), register_numl.get(),
+                                                               register_numr.get()));
+                            break;
+                        }
+                        int rl = register_numl.get();
+                        int rr = register_numr.get();
+                        bufferText->blankCurrent();
+                        if (shift > 0 && asmInstr == quou)
+                        {
+                            if (shift < 16)
+                                bufferText->addAfter(string_format("srli a%d,a%d,%d", rl, rl, shift));
+                            else
+                                bufferText->addAfter(string_format("extui a%d,a%d,%d,%d", rl, rl, shift, 32 - shift));
+                        }
+                        else if (shift > 0)
+                        {
+                            bufferText->addAfter(string_format("srai a%d,a%d,31", rr, rl));
+                            bufferText->addAfter(string_format("extui a%d,a%d,%d,%d", rr, rr, 32 - shift, shift));
+                            bufferText->addAfter(string_format(add, rl, rl, rr));
+                            bufferText->addAfter(string_format("srai a%d,a%d,%d", rl, rl, shift));
+                        }
+                        free(tocmp);
+                        break;
+                    }
+                }
+                free(tocmp);
+            }
             bufferText->addAfter(string_format(asmInstr, register_numl.get(), register_numl.get(), register_numr.get()));
         }
         // return;
@@ -1217,6 +1296,34 @@ void _visitoperatorNode(NodeToken *nd)
         // Signed unless an operand is uint32_t, as in C and as for `/`
         // above: `-7 % 3` is -1. It was always unsigned (remu), which
         // gave 0 for that (0xFFFFFFF9 % 3).
+        // An unsigned remainder by a constant power of two is a mask:
+        // extui keeps the low bits in one cycle (width up to 16 bits).
+        if (l == __uint32_t__ || r == __uint32_t__)
+        {
+            char *_last = bufferText->current();
+            char *tocmp = string_format("movi a%d,", register_numr.get());
+            bool done = false;
+            if (strncmp(_last, tocmp, strlen(tocmp)) == 0)
+            {
+                int a, b;
+                if (sscanf(_last, "movi a%d,%d", &a, &b) == 2 && b > 0 && (b & (b - 1)) == 0 && b <= 65536)
+                {
+                    int shift = 0;
+                    while ((1 << shift) < b)
+                        shift++;
+                    bufferText->blankCurrent();
+                    if (shift == 0)
+                        bufferText->addAfter(string_format(movi, register_numl.get(), 0));
+                    else
+                        bufferText->addAfter(string_format("extui a%d,a%d,0,%d", register_numl.get(),
+                                                           register_numl.get(), shift));
+                    done = true;
+                }
+            }
+            free(tocmp);
+            if (done)
+                break;
+        }
         bufferText->addAfter(string_format((l == __uint32_t__ || r == __uint32_t__) ? remu : rems,
                                            register_numl.get(), register_numl.get(), register_numr.get()));
         //  return;
