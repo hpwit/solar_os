@@ -1,4 +1,5 @@
 #include "nodetoken.h"
+#include "vectorize.h"
 #include "parser_define.h"
 #include "binding.h"
 #include "string_constants.h"
@@ -192,6 +193,11 @@ static void emitSafeBoundsCheck(NodeToken *nd, int sizeReg)
 }
 
 Text content, header, footer, *bufferText;
+// __ASM__ functions, kept out of the optimizer: its passes read the code's
+// text and know neither the q registers of the S3's ee.* instructions nor
+// that ee.vld.128.ip q0,a2,16 advances a2. Appended after the last pass
+// (appendAsmFunctions()).
+Text asmFunctions;
 void _visittypeNode(NodeToken *nd) {}
 // ---------------------------------------------------------------------
 // ffloat: 32-bit fixed point with FFLOAT_FRAC_BITS (16) fraction bits,
@@ -256,6 +262,18 @@ static const int _ffdiv_size = sizeof(_ffdiv) / sizeof(_ffdiv[0]);
 // Parser::parse() once the optimizer has run: the routine is hand-written,
 // and Pass 4 copy propagation would otherwise rewrite its last lines
 // across a branch (`mov a2,a5 / bgez / neg a2,a2` lost the mov).
+void appendAsmFunctions(Text *text)
+{
+    text->end();
+    for (int i = 0; i < asmFunctions.size(); i++)
+    {
+        const char *line = *asmFunctions.getChildAtPos(i);
+        if (line != NULL && line[0] != 0)
+            text->addAfter(line);
+    }
+    asmFunctions.clear();
+}
+
 void appendFfloatDivision(Text *text)
 {
     if (!addffloatdivision)
@@ -278,6 +296,28 @@ static int32_t ffloatOf(double v)
 }
 
 char *_numToBytes(uint32_t __num);
+
+// dst = src + value. addi reaches -128..127: the address of a local deep
+// in a large frame (a1 + 184) or a member far into a structure used to be
+// an addi the assembler refused.
+static void emitAddImmediate(int dst, int src, int value)
+{
+    if (value >= -128 && value <= 127)
+    {
+        bufferText->addAfter(string_format(addi, dst, src, value));
+        return;
+    }
+    if (dst != src && value >= -2048 && value <= 2047)
+    {
+        bufferText->addAfter(string_format(movi, dst, value));
+        bufferText->addAfter(string_format("add a%d,a%d,a%d", dst, src, dst));
+        return;
+    }
+    bufferText->addAfter(string_format(addi, dst, src, value > 0 ? 127 : -128));
+    for (value -= value > 0 ? 127 : -128; value > 127 || value < -128; value -= value > 0 ? 127 : -128)
+        bufferText->addAfter(string_format(addi, dst, dst, value > 0 ? 127 : -128));
+    bufferText->addAfter(string_format(addi, dst, dst, value));
+}
 
 // Loads v into register_numl.get() the way _visitnumberNode() loads an
 // integer literal (same side effects on register_numl and the sp stack).
@@ -866,6 +906,77 @@ static bool steppedAsPointer(NodeToken *operand)
     return operand->isPointer && !operand->asPointer && operand->children_size() == 0;
 }
 
+// The element size when `n` is a pointer in + or - (`p`, an array's
+// name, `p + 1`), 0 when it is a number.
+static int pointerArithStep(NodeToken *n)
+{
+    if (n->_nodetype == binOpNode && (n->type == TokenAddition || n->type == TokenSubstraction) &&
+        n->children_size() == 2)
+    {
+        int l = pointerArithStep(n->getChildPtr(0)), r = pointerArithStep(n->getChildPtr(1));
+        if (r == 0)
+            return l;
+        return n->type == TokenAddition && l == 0 ? r : 0; // n + p; p - q is a number
+    }
+    if (n->_nodetype == binOpNode || !steppedAsPointer(n) || n->getVarTypeObj() == NULL)
+        return 0;
+    return n->getVarTypeObj()->total_size;
+}
+
+static void emitScaleByConstant(int dst, int src, int k, int scratch);
+
+// reg *= k, folded into the movi that just loaded a constant
+static void scalePointerOffset(int reg, int k, int scratch)
+{
+    char *last = bufferText->current();
+    char *tocmp = string_format("movi a%d,", reg);
+    int a, b;
+    if (strncmp(last, tocmp, strlen(tocmp)) == 0 && sscanf(last, "movi a%d,%d", &a, &b) == 2)
+    {
+        bufferText->blankCurrent();
+        bufferText->addAfter(string_format(movi, reg, b * k));
+    }
+    else
+        emitScaleByConstant(reg, reg, k, scratch);
+    free(tocmp);
+}
+
+// p + n, n + p, p - n move by n elements, as in C; p - q counts the
+// elements between them. They added or subtracted bytes. Returns true
+// when it emitted p - q itself.
+static bool pointerArithmetic(NodeToken *nd)
+{
+    if ((nd->type != TokenAddition && nd->type != TokenSubstraction) || nd->children_size() != 2 ||
+        globalType.get() == __float__ || globalType.get() == __ffloat__)
+        return false;
+    int ls = pointerArithStep(nd->getChildPtr(0));
+    int rs = pointerArithStep(nd->getChildPtr(1));
+    int l = register_numl.get(), r = register_numr.get();
+    int scratch = l != 9 && r != 9 ? 9 : (l != 8 && r != 8 ? 8 : 10);
+    if (ls > 1 && rs == 0)
+        scalePointerOffset(r, ls, scratch);
+    else if (rs > 1 && ls == 0 && nd->type == TokenAddition)
+        scalePointerOffset(l, rs, scratch);
+    else if (rs > 1 && nd->type == TokenSubstraction) // p - q (f() - q: a pointer on the right is enough)
+    {
+        bufferText->addAfter(string_format(sub, l, l, r));
+        if ((rs & (rs - 1)) == 0)
+        {
+            int shift = 0;
+            while ((1 << shift) < rs)
+                shift++;
+            bufferText->addAfter(string_format("srai a%d,a%d,%d", l, l, shift));
+        }
+        else
+        {
+            bufferText->addAfter(string_format(movi, r, rs));
+            bufferText->addAfter(string_format(quos, l, l, r));
+        }
+        return true;
+    }
+    return false;
+}
+
 void _visitoperatorNode(NodeToken *nd)
 {
     // printf("operator %s\n",tokenNames[nd->type].c_str());
@@ -923,9 +1034,13 @@ void _visitoperatorNode(NodeToken *nd)
     asmInstruction asmInstr;
     bool intLeft = ffIntLeft, intRight = ffIntRight, divMaybeZero = ffDivMaybeZero;
     ffIntLeft = ffIntRight = ffDivMaybeZero = false; // only for this operator, not nested ones
-    if (nd->children_size() >= 2 && !intRight && !(globalType.get() == __ffloat__ && (nd->type == TokenShiftLeft || nd->type == TokenShiftRight)))
+    // a pointer operand of + or - is an address, never converted
+    bool addSub = (nd->type == TokenAddition || nd->type == TokenSubstraction) && nd->children_size() >= 2;
+    bool ptrLeft = addSub && pointerArithStep(nd->getChildPtr(0)) > 0;
+    bool ptrRight = addSub && pointerArithStep(nd->getChildPtr(1)) > 0;
+    if (nd->children_size() >= 2 && !intRight && !ptrRight && !(globalType.get() == __ffloat__ && (nd->type == TokenShiftLeft || nd->type == TokenShiftRight)))
         translateType(globalType.get(), r, register_numr.get());
-    if (!intLeft)
+    if (!intLeft && !ptrLeft)
         translateType(globalType.get(), l, register_numl.get());
     if (globalType.get() == __ffloat__ && nd->type == TokenStar)
     {
@@ -999,6 +1114,8 @@ void _visitoperatorNode(NodeToken *nd)
         addffloatdivision = true;
         return;
     }
+    if (pointerArithmetic(nd))
+        return;
     switch (nd->type)
     {
     case TokenAddition:
@@ -1745,6 +1862,11 @@ void _visitglobalVariableNode(NodeToken *nd)
             bufferText->sp.push(bufferText->get());
         }
     }
+    else if (isBarePointer(nd) && strncmp(nd->getText(), "local_string_", 13) != 0) // `uint16_t *gp;` read as a value: the address it holds (a string literal is its characters)
+    {
+        bufferText->addAfter(string_format(l32i, register_numl.get(), point_regnum, 0));
+        bufferText->sp.push(bufferText->get());
+    }
     else // s(leds)
     {
         bufferText->addAfter(string_format(mov, register_numl.get(), point_regnum));
@@ -2224,8 +2346,11 @@ void _visitassignementNode(NodeToken *nd)
     bufferText->sp.push(bufferText->get());
     register_numl.duplicate();
 
+    // `float *f = fl + 2;`: the value is f's address, an int, not a float
+    bool pointerValue = nd->children_size() > 1 && steppedAsPointer(nd->getChildPtr(0)) &&
+                        nd->getChildPtr(0)->type != TokenUserDefinedVariableMemberFunction;
     if (nd->children_size() > 1)
-        globalType.push(nd->getChildPtr(0)->getVarTypeObj()->_varType);
+        globalType.push(pointerValue ? __int__ : nd->getChildPtr(0)->getVarTypeObj()->_varType);
 
     if (nd->children_size() > 1)
     {
@@ -2233,7 +2358,7 @@ void _visitassignementNode(NodeToken *nd)
         nd->getChildPtr(1)->visitNode();
         register_numl.pop();
 
-        if (nd->getChildPtr(1)->getVarTypeObj() != NULL)
+        if (nd->getChildPtr(1)->getVarTypeObj() != NULL && !pointerValue)
         {
 
             translateType(globalType.get(), nd->getChildPtr(1)->getVarTypeObj()->_varType, register_numl.get());
@@ -3312,6 +3437,9 @@ void _visitforConditionRotated(NodeToken *test, char *bodyLabel, int distance)
 
 void _visitforNode(NodeToken *nd)
 {
+    // a loop over byte arrays: ESP32-S3 vector code (see vectorize.cpp)
+    if (vectorizeLoop(nd))
+        return;
     // printf("ente for\n") ;
     point_regnum = 5;
 
@@ -3578,6 +3706,9 @@ void _visitextGlobalVariableNode(NodeToken *nd)
         else
         {
             bufferText->addAfter(string_format("movExt a%d,@_ext_%s", register_numl.get(), nd->getText()));
+            // `external uint16_t *led16;` read as a value: the address it holds
+            if (isBarePointer(nd) && !nd->asPointer)
+                bufferText->addAfter(string_format(l32i, register_numl.get(), register_numl.get(), 0));
             bufferText->sp.push(bufferText->get());
             bufferText->sp.push(bufferText->get());
             register_numl.pop();
@@ -3807,6 +3938,112 @@ void _visitjsonBindingNode(NodeToken *nd)
                                   (unsigned)nd->_total_size));
 }
 
+// One value of a global's initializer, as the bytes of `type`: -1 is a
+// unary minus over the number 1, read through the signs (it used to read
+// as 0).
+static uint32_t initializerBits(NodeToken *ndt, varTypeEnum type)
+{
+    bool negative = false;
+    while (ndt->_nodetype == unitaryOpNode && ndt->children_size() == 1 &&
+           (ndt->type == TokenSubstraction || ndt->type == TokenNegation || ndt->type == TokenAddition))
+    {
+        if (ndt->type != TokenAddition)
+            negative = !negative;
+        ndt = ndt->getChildPtr(0);
+    }
+    if (type == __float__ || type == __ffloat__)
+    {
+        float __f = 0;
+        sscanf(ndt->getText(), "%f", &__f);
+        if (negative)
+            __f = -__f;
+        if (type == __ffloat__)
+            return (uint32_t)(int32_t)(__f * (1 << FFLOAT_FRAC_BITS));
+        uint32_t bits;
+        memcpy(&bits, &__f, 4);
+        return bits;
+    }
+    // hex as in expressions (0x38); %u alone read 0x38 as 0
+    const char *text = ndt->getText();
+    uint32_t __num = text == NULL ? 0 : (uint32_t)strtoul(text, NULL, strchr(text, 'x') || strchr(text, 'X') ? 16 : 10);
+    return negative ? 0u - __num : __num;
+}
+
+// A string literal in an initializer ("red" in `char *names[] = {"red"}`)
+static bool isStringValue(NodeToken *v)
+{
+    return v->_nodetype == globalVariableNode && v->getText() != NULL &&
+           strncmp(v->getText(), "local_string_", 13) == 0;
+}
+
+// The address of a string can't be part of a global's data: the loader
+// relocates the code's references, not data. The footer, the code run
+// once at load for the globals, stores it: array's bytes at `offset` get
+// the address of `label`.
+static void storeStringAddress(const char *array, int offset, const char *label)
+{
+    footer.addAfter(string_format("l32r a14,@_%s", array));
+    footer.addAfter(string_format("l32r a15,@_%s", label));
+    while (offset > 1020) // s32i reaches 1020
+    {
+        int step = offset > 8188 ? 8188 : offset & ~3;
+        footer.addAfter(string_format(movi, 13, step >> 2));
+        footer.addAfter(string_format("slli a13,a13,2"));
+        footer.addAfter(string_format("add a14,a14,a13"));
+        offset -= step;
+    }
+    footer.addAfter(string_format(s32i, 15, 14, offset));
+}
+
+// The values of an initializer element, in order: {1, {2, 3}} and
+// {1, CRGB(2, 3, 4)} are flattened.
+static void initializerValues(NodeToken *nd, vect<NodeToken *> *values)
+{
+    for (int i = 0; i < nd->children_size(); i++)
+    {
+        NodeToken *v = nd->getChildPtr(i);
+        if (v->_nodetype == statementNode || (v->_nodetype != unitaryOpNode && v->children_size() > 0))
+            initializerValues(v, values);
+        else
+            values->push_back(v);
+    }
+}
+
+// One element of a struct array's initializer, `{1, 2.5, 3}`: its fields
+// in the struct's C layout, padding as zeros, missing fields as 0.
+// A string goes in a char * field through the footer (see
+// storeStringAddress()): `offset` is the element's place in `array`.
+static char *structInitializerBytes(char *data, varType *st, NodeToken *element, const char *array, int offset)
+{
+    vect<NodeToken *> values;
+    initializerValues(element, &values);
+    int value = 0, member = 0, inMember = 0;
+    for (int comp = 0; comp < st->size; comp++)
+    {
+        uint32_t bits = 0;
+        if (!((st->fillers >> comp) & 1))
+        {
+            if (value < values.size() && isStringValue(values[value]))
+                storeStringAddress(array, offset, values[value]->getText());
+            else if (value < values.size())
+                bits = initializerBits(values[value], st->types[member]);
+            value++;
+            if (++inMember >= st->memberSize[member])
+            {
+                member++;
+                inMember = 0;
+            }
+        }
+        for (int i = 0; i < st->sizes[comp]; i++)
+        {
+            data = str_concat("%s %02x", data, bits & 0xff);
+            bits = bits / 256;
+        }
+        offset += st->sizes[comp];
+    }
+    return data;
+}
+
 void _visitdefGlobalVariableNode(NodeToken *nd)
 {
     if (strcmp(nd->getText(), _handle_) == 0)
@@ -3835,13 +4072,34 @@ void _visitdefGlobalVariableNode(NodeToken *nd)
                         for (int ndtindex = 0; ndtindex < ndt->children_size(); ndtindex++)
                         {
                             NodeToken *ndtc = ndt->getChildPtr(ndtindex);
-                            int __num = 0;
-                            sscanf(ndtc->getText(), "%d", &__num);
-                            _data_sav = str_concat("%s %02x", _data_sav, __num);
+                            uint32_t __num = initializerBits(ndtc, __uint8_t__);
+                            _data_sav = str_concat("%s %02x", _data_sav, __num & 0xff);
                         }
                     }
                 }
             }
+        }
+        else if (nd->getVarTypeObj()->_varType == __char__ && isBarePointer(nd) &&
+                 strncmp(nd->getText(), "local_string_", 13) != 0) // a literal is its characters
+        {
+            // char *word = "pointer"; a pointer, as in C: the characters
+            // under a label of their own, their address stored at load
+            // (see storeStringAddress()). They were word's own bytes, so
+            // `word = other;` overwrote the text and word + 3 was wrong.
+            char *str = nd->getChildPtr(0)->getText();
+            char *chars = NULL;
+            for (int i = 1; i < strlen(str) - 1; i++)
+                chars = str_concat("%s %02x", chars, str[i]);
+            chars = str_concat("%s 00", chars);
+            nd->_total_size = 4;
+            header.addAfter(".bytes 4 00 00 00 00");
+            header.addAfter(string_format("@_%s__chars:", nd->getText()));
+            header.addAfter(string_format(".bytes %d%s", (int)strlen(str) - 1, chars));
+            free(chars);
+            char *label = string_format("%s__chars", nd->getText());
+            storeStringAddress(nd->getText(), 0, label);
+            free(label);
+            return;
         }
         else if (nd->getVarTypeObj()->_varType == __char__)
         {
@@ -3853,51 +4111,32 @@ void _visitdefGlobalVariableNode(NodeToken *nd)
             }
             _data_sav = str_concat("%s 00", _data_sav);
         }
+        else if (nd->getVarTypeObj()->_varType == __userDefined__ &&
+                 (nd->target == EOF_TEXTARRAY || nd->getTargetText()[0] != '@'))
+        {
+            // one structure: item one = {"apple", 3};
+            _data_sav = structInitializerBytes(_data_sav, nd->getVarTypeObj(), nd, nd->getText(), 0);
+        }
+        else if (nd->getVarTypeObj()->_varType == __userDefined__)
+        {
+            for (int ndindex = 0; ndindex < nd->children_size(); ndindex++)
+                _data_sav = structInitializerBytes(_data_sav, nd->getVarTypeObj(), nd->getChildPtr(ndindex),
+                                                   nd->getText(), ndindex * nd->getVarTypeObj()->_varSize);
+        }
         else
         {
-            uint32_t __num;
-            __num = 0;
-            uint8_t c;
-            if (nd->children_size() > 0)
+            for (int ndindex = 0; ndindex < nd->children_size(); ndindex++)
             {
-                // for (NodeToken *ndt : *nd->children)
-                // {
-                for (int ndindex = 0; ndindex < nd->children_size(); ndindex++)
+                uint32_t __num = 0;
+                if (isStringValue(nd->getChildPtr(ndindex))) // char *names[] = {"red", ...}
+                    storeStringAddress(nd->getText(), ndindex * nd->getVarTypeObj()->total_size,
+                                       nd->getChildPtr(ndindex)->getText());
+                else
+                    __num = initializerBits(nd->getChildPtr(ndindex), nd->getVarTypeObj()->_varType);
+                for (int i = 0; i < nd->getVarTypeObj()->total_size; i++)
                 {
-                    NodeToken *ndt = nd->getChildPtr(ndindex);
-                    // -1 is a unary minus over the number 1: read through
-                    // the signs down to the number (it used to read as 0)
-                    bool negative = false;
-                    while (ndt->_nodetype == unitaryOpNode && ndt->children_size() == 1 &&
-                           (ndt->type == TokenSubstraction || ndt->type == TokenNegation || ndt->type == TokenAddition))
-                    {
-                        if (ndt->type != TokenAddition)
-                            negative = !negative;
-                        ndt = ndt->getChildPtr(0);
-                    }
-                    if (nd->getVarTypeObj()->_varType == __float__)
-                    {
-                        float __f = 0;
-                        sscanf(ndt->getText(), "%f", &__f);
-                        if (negative)
-                            __f = -__f;
-                        __num = (uint32_t)(*((uint32_t *)&__f));
-                    }
-                    else
-                    {
-                        __num = 0;
-                        sscanf(ndt->getText(), "%u", &__num);
-                        if (negative)
-                            __num = 0u - __num;
-                    }
-                    for (int i = 0; i < nd->getVarTypeObj()->total_size; i++)
-                    {
-                        c = __num & 0xff;
-                        _data_sav = str_concat("%s %02x", _data_sav, c);
-                        //_data_sav = _data_sav + " " + string_format("%02x", c);
-                        // val=val+'A';
-                        __num = __num / 256;
-                    }
+                    _data_sav = str_concat("%s %02x", _data_sav, __num & 0xff);
+                    __num = __num / 256;
                 }
             }
         }
@@ -4017,12 +4256,12 @@ void _visitstoreLocalVariableNode(NodeToken *nd)
 
                 if (isStructFunction)
                 {
-                    bufferText->addAfter(string_format(addi, point_regnum, 2, (int)(nd->stack_pos / 1000)));
+                    emitAddImmediate(point_regnum, 2, (int)(nd->stack_pos / 1000));
                 }
                 else
                 {
                     bufferText->addAfter(string_format(l32i, point_regnum, 1, nd->stack_pos - (int)(nd->stack_pos / 1000) * 1000));
-                    bufferText->addAfter(string_format(addi, point_regnum, point_regnum, (int)(nd->stack_pos / 1000)));
+                    emitAddImmediate(point_regnum, point_regnum, (int)(nd->stack_pos / 1000));
                 }
             }
             else
@@ -4032,7 +4271,7 @@ void _visitstoreLocalVariableNode(NodeToken *nd)
         else
         {
             // a remettre
-            bufferText->addAfter(string_format(addi, point_regnum, 1, nd->stack_pos));
+            emitAddImmediate(point_regnum, 1, nd->stack_pos);
         }
         bufferText->end();
         bufferText->sp.pop();
@@ -4076,6 +4315,7 @@ void _visitstoreGlobalVariableNode(NodeToken *nd)
     }
     // string body = "";
     //  register_numl++;
+    int pointerStart = start; // `gs = pts;` with `pt *gs`: the pointer itself, not its last member
     for (int h = 0; h < v->size - 1; h++)
     {
         start += v->sizes[h];
@@ -4096,7 +4336,7 @@ void _visitstoreGlobalVariableNode(NodeToken *nd)
 
     else
     {
-        bufferText->addAfter(bufferText->sp.pop(), string_format(s32i, register_numl.get(), point_regnum, start));
+        bufferText->addAfter(bufferText->sp.pop(), string_format(s32i, register_numl.get(), point_regnum, pointerStart));
     }
 
     bufferText->sp.push(bufferText->get());
@@ -4224,6 +4464,7 @@ void _visitstoreExtGlocalVariableNode(NodeToken *nd)
     int savreg_num = point_regnum;
     point_regnum = 6; // YBA 25-02-2025
     // register_numl++;
+    int pointerStart = start; // the pointer itself, not its last member
     for (int h = 0; h < v->size - 1; h++)
     {
         start += v->sizes[h];
@@ -4240,7 +4481,7 @@ void _visitstoreExtGlocalVariableNode(NodeToken *nd)
     }
     else
     {
-        bufferText->addAfter(bufferText->sp.pop(), string_format(s32i, register_numl.get(), point_regnum, start));
+        bufferText->addAfter(bufferText->sp.pop(), string_format(s32i, register_numl.get(), point_regnum, pointerStart));
     }
     // res.f = f;
     // res.header = number.header + h;
@@ -4553,7 +4794,8 @@ void _visitreturnNode(NodeToken *nd)
 
 void _visitdefAsmFunctionNode(NodeToken *nd)
 {
-    bufferText = &content;
+    bufferText = &asmFunctions;
+    asmFunctions.end();
     header.addAfter(string_format(".global @_%s", nd->getText()));
     bufferText->addAfter(string_format("@_%s:", nd->getText()));
     header.addAfter(string_format("@_stack_%s:", nd->getText()));
@@ -4602,7 +4844,11 @@ void _visitchangeTypeNode(NodeToken *nd)
         (globalType.get() == __ffloat__ || containsValueOfType(nd, __ffloat__)))
         nd->_vartype = __ffloat__;
 
-    globalType.push(nd->getVarTypeObj()->_varType);
+    // a pointer (`fl`, `fl + 2` with `float fl[4]`) is an address: computed
+    // as an int, whatever it points to
+    bool pointerExpr = strlen(nd->getText()) == 0 && nd->children_size() == 1 &&
+                       pointerArithStep(nd->getChildPtr(0)) > 0;
+    globalType.push(pointerExpr ? __int__ : nd->getVarTypeObj()->_varType);
     for (int i = 0; i < nd->children_size(); i++)
     {
 
@@ -4613,7 +4859,7 @@ void _visitchangeTypeNode(NodeToken *nd)
         // f = f + g.f;
         // h = h + g.header;
 
-        if (nd->getChildPtr(i)->getVarTypeObj() != NULL)
+        if (nd->getChildPtr(i)->getVarTypeObj() != NULL && !pointerExpr)
         {
             // register_numl.pop();
             if (strlen(nd->getChildPtr(i)->getText()) > 0)
@@ -4674,8 +4920,8 @@ void _visitswitchNode(NodeToken *nd)
             otherwise = c->getTargetText();
             continue;
         }
-        int k = 0;
-        sscanf(c->getChildPtr(0)->getText(), "%d", &k);
+        const char *label = c->getChildPtr(0)->getText();
+        int k = label == NULL ? 0 : (int)strtol(label, NULL, strchr(label, 'x') || strchr(label, 'X') ? 16 : 10);
         if (isBranchImmediate(k, false))
         {
             bufferText->addAfter(string_format(beqi, value, valBranchImmediate(k), c->getTargetText(), ""));
@@ -4929,7 +5175,7 @@ void _visitcallConstructorNode(NodeToken *nd)
 
     if (nd->stack_pos > 0)
     {
-        bufferText->addAfter(string_format(addi, 5, 1, nd->stack_pos));
+        emitAddImmediate(5, 1, nd->stack_pos);
     }
     else
     {
